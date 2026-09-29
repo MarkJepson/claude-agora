@@ -32,7 +32,12 @@ usage="usage: mailwatch.sh <role> <after_id> [interval_seconds]"
 ROLE=${1:?$usage}
 AFTER=${2:?$usage}
 INTERVAL=${3:-20}
-URL=${RELAY_URL:-http://127.0.0.1:8089}
+# RELAY_URL env var, then a per-repo .relay-url file (same precedence as
+# scripts/relay's resolve_role) -- a non-interactive shell doesn't source
+# ~/.bashrc, so a checked-in file is what actually works everywhere.
+URL=${RELAY_URL:-}
+[ -z "$URL" ] && [ -f .relay-url ] && URL=$(tr -d '[:space:]' < .relay-url)
+URL=${URL:-http://127.0.0.1:8089}
 die() { echo "mailwatch: $*" >&2; exit 2; }
 
 [[ $AFTER =~ ^[0-9]+$ ]] || die "after_id must be a number, got '$AFTER'"

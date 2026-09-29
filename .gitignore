@@ -4,3 +4,5 @@ data/*.sqlite3-shm
 __pycache__/
 *.pyc
 .env
+.relay-role
+.relay-url

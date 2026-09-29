@@ -34,7 +34,24 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-API_BASE = os.environ.get("RELAY_URL", "http://127.0.0.1:8089")
+def _resolve_api_base() -> str:
+    """RELAY_URL env var, then a per-repo .relay-url file, else the
+    default -- same precedence as resolve_role() below. Exists because a
+    non-interactive shell (e.g. Claude Code's Bash tool) doesn't source
+    ~/.bashrc, so an env var set there never reaches this process; a
+    checked-in .relay-url file works regardless of shell/tool."""
+    env = os.environ.get("RELAY_URL")
+    if env:
+        return env.rstrip("/")
+    cfg = Path.cwd() / ".relay-url"
+    if cfg.is_file():
+        url = cfg.read_text().strip()
+        if url:
+            return url.rstrip("/")
+    return "http://127.0.0.1:8089"
+
+
+API_BASE = _resolve_api_base()
 OPERATOR = "operator"
 ATTENTION_KINDS = {"decision", "approval", "security", "bug", "other"}
 

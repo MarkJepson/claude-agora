@@ -23,7 +23,12 @@
 # Exit 0: found a newly-stale role, printed as "role<TAB>session_name<TAB>heartbeat_at<TAB>age_s".
 # Exit 2: usage error or the relay rejected a request outright (not "down").
 set -u
-API=${RELAY_URL:-http://127.0.0.1:8089}
+# RELAY_URL env var, then a per-repo .relay-url file (same precedence as
+# scripts/relay's resolve_role) -- a non-interactive shell doesn't source
+# ~/.bashrc, so a checked-in file is what actually works everywhere.
+API=${RELAY_URL:-}
+[ -z "$API" ] && [ -f .relay-url ] && API=$(tr -d '[:space:]' < .relay-url)
+API=${API:-http://127.0.0.1:8089}
 
 if [ $# -lt 1 ]; then
   echo "usage: $0 <state-file> [interval_s=60] [stale_s=600]" >&2
