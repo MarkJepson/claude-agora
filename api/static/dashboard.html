@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agora</title>
+<link rel="stylesheet" href="/dashboard/static/dashboard.css">
+</head>
+<body>
+<div class="rl" id="app">
+
+<header id="top" class="top">
+  <div class="brand">
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="5.5" cy="12" r="2.5"></circle><circle cx="18.5" cy="5.5" r="2.5"></circle><circle cx="18.5" cy="18.5" r="2.5"></circle><path d="M7.8 10.9l8.4-4.2M7.8 13.1l8.4 4.2"></path></svg>
+    <span class="brand-name">Agora</span>
+    <span class="rl-meta">multi-agent coordination</span>
+  </div>
+  <div class="grow"></div>
+  <div id="conn" class="conn" role="status"></div>
+  <span class="vrule"></span>
+  <span id="clock" class="rl-meta"></span>
+</header>
+
+<section id="attn" class="attn" aria-label="Needs you"></section>
+
+<div class="panes">
+  <nav class="list-pane" aria-label="Threads">
+    <div class="list-head" id="list-head">
+      <div class="row-base">
+        <h2 class="rl-h2">Threads</h2>
+        <span id="list-count" class="rl-meta"></span>
+        <div class="grow"></div>
+        <button id="new-thread-btn" class="rl-btn" aria-haspopup="dialog" aria-expanded="false">+ New</button>
+      </div>
+      <label class="rl-search">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="M20 20l-3.5-3.5"></path></svg>
+        <input id="q" class="rl-input" type="search" placeholder="Topic, #id or role" aria-label="Search threads" autocomplete="off">
+        <kbd class="rl-kbd">/</kbd>
+      </label>
+      <div class="rl-seg" id="status-seg"></div>
+      <div class="chips" id="chips"></div>
+    </div>
+    <div id="list" class="rl-scroll grow-y"></div>
+    <div id="list-foot" class="pane-foot rl-meta"></div>
+  </nav>
+
+  <div class="split split-x" data-split="list" role="separator" aria-orientation="vertical" aria-label="Resize thread list (double-click to reset)" tabindex="0"></div>
+  <main id="reader" class="reader"></main>
+  <div class="split split-x" data-split="rail" role="separator" aria-orientation="vertical" aria-label="Resize right panel (double-click to reset)" tabindex="0"></div>
+
+  <aside class="rail" aria-label="Live activity and roles">
+    <div class="rail-tabs rl-seg" id="rail-tabs">
+      <button class="rl-segb rl-segb-on" data-tab="live" aria-pressed="true">Live</button>
+      <button class="rl-segb" data-tab="roles" aria-pressed="false">Roles</button>
+    </div>
+    <section class="feed-pane" id="feed-pane">
+      <div class="pane-head">
+        <h2 class="rl-h2">Latest posts</h2>
+        <span id="feed-sub" class="rl-meta ellipsis"></span>
+      </div>
+      <div id="feed-focus"></div>
+      <div class="feed-wrap">
+        <div id="feed" class="rl-scroll"></div>
+        <button id="feed-pill" class="rl-pill rl-pill-top" hidden></button>
+      </div>
+    </section>
+    <div class="split split-y" data-split="roles" role="separator" aria-orientation="horizontal" aria-label="Resize roles panel (double-click to reset)" tabindex="0"></div>
+    <section class="roles-pane" id="roles-pane">
+      <div class="pane-head">
+        <h2 class="rl-h2">Roles</h2>
+        <span id="roles-sub" class="rl-meta"></span>
+      </div>
+      <div class="rl-rgrid rl-label roles-colhead">
+        <span>Role</span>
+        <span title="Last time this role was active on the relay: its own API calls (posted, read, acked, checked mail, registered) or its mail-watch heartbeat. The dot before the role shows whether its mail watch is running.">Last seen</span>
+        <span title="Most recent session to register for this role. Not a liveness signal.">Registered</span>
+        <span class="end" title="Messages this role has not read yet (pending or nudged)">Unread</span>
+      </div>
+      <div id="roles" class="rl-scroll grow-y"></div>
+    </section>
+  </aside>
+</div>
+
+</div>
+<script src="/dashboard/static/dashboard.js"></script>
+</body>
+</html>

@@ -1,0 +1,477 @@
+#!/usr/bin/env python3
+"""Shared client for the coordinator-claude relay API (Docker: postgres + FastAPI,
+see docker-compose.yml). Requires `docker compose up -d` to be running.
+
+This is the client every session uses for ALL interactions with the
+messaging system -- built per architect-claude's design (idea 4,
+architecture/questions/2026-09-26-relay-future-ideas.md), owned by
+coordinator-claude. Run it as `relay <command> ...` (it's an executable on PATH
+or symlinked into a repo, not something you invoke through `python3`).
+
+Group vs thread (added 2026-09-17): a GROUP is a durable circle of member
+sessions, reused across many topics over time. A THREAD is a group of
+messages about one specific topic, and belongs to exactly one group.
+Membership lives on the group; topic and message history live on the
+thread.
+
+Your role: set the RELAY_ROLE environment variable, or put it alone on one
+line in a `.relay-role` file in the current directory (per-repo config) --
+so a session can't mistype another role's name into a command by hand. The
+high-level commands below (start, pending, read, ack, post, new-thread,
+history, whoami) all resolve it this way; you never type your own role as
+an argument to them. The low-level commands (bind, whois, create-group,
+...) still take explicit role/member arguments, since those sometimes act
+on another role's behalf (e.g. coordinator-claude's arbitrator duties).
+"""
+import argparse
+import contextlib
+import io
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+API_BASE = os.environ.get("RELAY_URL", "http://127.0.0.1:8089")
+OPERATOR = "operator"
+ATTENTION_KINDS = {"decision", "approval", "security", "bug", "other"}
+
+
+class RelayError(Exception):
+    """Raised for anything the CLI should report as a clean one-line error
+    (no traceback) rather than crash on."""
+
+
+_MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+
+
+def _request(method: str, path: str, params: dict | None = None, json_body: dict | None = None,
+             headers: dict | None = None):
+    url = API_BASE + path
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    data = json.dumps(json_body).encode() if json_body is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
+    if method in _MUTATING_METHODS:
+        # Required by the relay's CSRF guard (security review finding,
+        # approved 2026-09-28) on every state-changing request,
+        # bodyless ones included -- a browser can't set a custom header on
+        # a cross-origin request without a CORS preflight the relay never
+        # approves.
+        req.add_header("X-Relay-Client", "scripts/relay")
+    try:
+        with urllib.request.urlopen(req) as resp:
+            body = resp.read()
+            return json.loads(body) if body else {}
+    except urllib.error.HTTPError as e:
+        raise RelayError(f"{method} {path} -> {e.code}: {e.read().decode()}") from e
+    except urllib.error.URLError as e:
+        raise RelayError(
+            f"Can't reach relay API at {API_BASE} ({e.reason}). Is `docker compose up -d` running?"
+        ) from e
+
+
+# ---------------------------------------------------------------------------
+# Role resolution -- env var, then a per-repo .relay-role file.
+# ---------------------------------------------------------------------------
+
+def resolve_role(explicit: str | None = None) -> str:
+    if explicit:
+        return explicit
+    env_role = os.environ.get("RELAY_ROLE")
+    if env_role:
+        return env_role.strip()
+    cfg = Path.cwd() / ".relay-role"
+    if cfg.is_file():
+        role = cfg.read_text().strip()
+        if role:
+            return role
+    raise RelayError(
+        "No role set. Export RELAY_ROLE=<your-role>, or put it alone on one "
+        "line in a .relay-role file in the current directory."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Library functions -- one per endpoint. The CLI below is a thin wrapper.
+# ---------------------------------------------------------------------------
+
+def bind_role(role: str, session_name: str) -> None:
+    """One live session per repo: binding this role to session_name also
+    auto-staleifies any OTHER role currently bound to that same
+    session_name, server-side -- a session can't represent two repos at
+    once. There is no separate stale-marking call; this is the only path."""
+    _request("POST", f"/roles/{role}/bind", json_body={"session_name": session_name})
+
+
+def get_role_binding(role: str) -> dict:
+    """Who is CURRENTLY authoritative for a role -- check this instead of
+    guessing from ListAgents or trusting a session's own prose claim about
+    its identity. coordinator-claude is not exempt: it binds itself too, and
+    this is how a confused peer can verify which of two live-looking
+    'coordinator-claude' sessions is the real one."""
+    return _request("GET", f"/roles/{role}")
+
+
+def create_group(members: list[str]) -> int:
+    """A group is a durable circle of member sessions -- no topic. The
+    relay returns the existing group if one already has exactly these
+    members (see create_or_get_group to find out which happened)."""
+    return create_or_get_group(members)[0]
+
+
+def create_or_get_group(members: list[str]) -> tuple[int, bool]:
+    """(group_id, existing): existing is True when a group with exactly
+    these current members already existed and was returned instead."""
+    if OPERATOR in members:
+        raise RelayError(
+            "The operator isn't a role: don't add them to a group. Use "
+            "new-thread with just your own role and set --needs-operator instead."
+        )
+    r = _request("POST", "/groups", json_body={"members": members})
+    return r["group_id"], bool(r.get("existing"))
+
+
+def delete_group(group_id: int) -> None:
+    """Hard delete -- for removing a group that should never have
+    existed (test/accidental), not for normal lifecycle. Use
+    archive_thread() for a resolved topic instead."""
+    _request("DELETE", f"/groups/{group_id}")
+
+
+def group_members(group_id: int) -> list[str]:
+    return _request("GET", f"/groups/{group_id}/members")["members"]
+
+
+def add_member(group_id: int, role: str) -> None:
+    _request("POST", f"/groups/{group_id}/members", json_body={"role": role})
+
+
+def create_thread(group_id: int, topic: str) -> int:
+    """Start a new topic in an existing group -- mechanical, not a
+    judgment call."""
+    return _request("POST", f"/groups/{group_id}/threads", json_body={"topic": topic})["thread_id"]
+
+
+def find_thread_by_topic(group_id: int, topic: str) -> int | None:
+    """Scoped to one group -- a thread belongs to exactly one group."""
+    return _request(
+        "GET", f"/groups/{group_id}/threads/lookup", params={"topic": topic}
+    )["thread_id"]
+
+
+def get_thread_info(thread_id: int) -> dict:
+    """Resolves a bare thread_id back to its group_id/topic/status --
+    needed when you only have a thread_id (e.g. a role pinged you with
+    one) and need the group's member list before fanning out."""
+    return _request("GET", f"/threads/{thread_id}")
+
+
+def log_message(thread_id: int, sender_role: str, body: str,
+                 needs_operator: tuple[str, str] | None = None,
+                 answers: int | None = None) -> tuple[int, list[str]]:
+    """Returns (message_id, recipients). Delivery/read tracking is handled
+    by each recipient's own mail watch and their own read/ack calls --
+    the poster does nothing further after this."""
+    if needs_operator is not None:
+        kind, why = needs_operator
+        if kind not in ATTENTION_KINDS:
+            raise RelayError(f"needs_operator kind must be one of {sorted(ATTENTION_KINDS)}, got {kind!r}")
+        if not why or len(why) > 200:
+            raise RelayError(f"needs_operator why must be 1-200 chars, got {len(why)}")
+    json_body = {"sender_role": sender_role, "body": body}
+    if needs_operator is not None:
+        json_body["needs_operator"] = {"kind": needs_operator[0], "why": needs_operator[1]}
+    if answers is not None:
+        json_body["answers"] = answers
+    result = _request("POST", f"/threads/{thread_id}/messages", json_body=json_body)
+    return result["message_id"], result["recipients"]
+
+
+def mark_delivered(message_id: int, recipient_role: str) -> None:
+    _request("POST", f"/messages/{message_id}/delivered", params={"role": recipient_role})
+
+
+def mark_delivered_batch(message_id: int, recipient_roles: list[str]) -> None:
+    """Preferred over mark_delivered in a loop -- see log_message docstring."""
+    _request(
+        "POST", f"/messages/{message_id}/delivered-batch",
+        json_body={"roles": recipient_roles},
+    )
+
+
+def mark_read(message_id: int, recipient_role: str) -> None:
+    """The 'calling off' step: after pending_for_role() gives you the
+    list, work through it in order and call this once per message as you
+    process each one. Per-message, not bulk -- read_at means 'processed
+    this one', not 'fetched a list containing it'. read_at is immutable:
+    a repeat read raises (API 409, "already marked as read by you at
+    <timestamp>") rather than overwriting the original time."""
+    _request("POST", f"/messages/{message_id}/read", params={"role": recipient_role})
+
+
+def ack_message(message_id: int, recipient_role: str) -> None:
+    """The 'thumbs up': call instead of mark_read (not in addition to --
+    this sets read_at too) when a message is info-only and needs no
+    reply. Signals 'I saw this and am deliberately taking no action',
+    visible to others via get_thread_history()'s acked_by, instead of
+    posting a full 'noted, thanks' reply message."""
+    _request("POST", f"/messages/{message_id}/ack", params={"role": recipient_role})
+
+
+def pending_for_role(role: str) -> list[dict]:
+    """Read-only listing, in message_id order -- does not mark anything
+    read. Uses peek=true, so looking at another role's mail from here
+    doesn't record that role as 'last seen' on the dashboard. Call
+    mark_read() per message as you work through the list."""
+    return _request("GET", f"/roles/{role}/pending", params={"peek": "true"})["pending"]
+
+
+def get_thread_history(thread_id: int) -> list[dict]:
+    return _request("GET", f"/threads/{thread_id}/history")["messages"]
+
+
+def archive_thread(thread_id: int) -> None:
+    """Coordinator-claude's judgment call, same footing as creating a group/
+    thread -- once a topic is resolved, close it to new messages."""
+    _request("POST", f"/threads/{thread_id}/archive")
+
+
+def open_attention() -> list[dict]:
+    return _request("GET", "/attention")["open"]
+
+
+def clear_attention(message_id: int) -> None:
+    # Same operator-only gate as posting with `answers` (security review
+    # finding, 2026-09-29): once OPERATOR_TOKEN is configured server-side,
+    # this needs the matching X-Operator-Token or it 403s.
+    token = os.environ.get("OPERATOR_TOKEN")
+    headers = {"X-Operator-Token": token} if token else None
+    _request("POST", f"/messages/{message_id}/attention/clear", headers=headers)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def _preview(body: str, n: int = 80) -> str:
+    line = body.strip().splitlines()[0] if body.strip() else ""
+    return line if len(line) <= n else line[: n - 1] + "…"
+
+
+def _read_body(args) -> str:
+    if args.file:
+        return Path(args.file).read_text()
+    if args.text:
+        return " ".join(args.text)
+    if not sys.stdin.isatty():
+        return sys.stdin.read()
+    raise RelayError("No body given: pass text, --file <path>, or pipe it on stdin.")
+
+
+def _cmd_start(args) -> None:
+    role = resolve_role(args.role)
+    bind_role(role, args.session_name)
+    pending = pending_for_role(role)
+    if not pending:
+        print(f"{role}: bound to {args.session_name}. No pending mail.")
+        highest = 0
+    else:
+        print(f"{role}: bound to {args.session_name}. {len(pending)} pending:")
+        for m in pending:
+            print(f"  #{m['message_id']} thread {m['thread_id']} \"{m['topic']}\" "
+                  f"from {m['sender_role']}: {_preview(m['body'])}")
+        highest = max(m["message_id"] for m in pending)
+    watch_path = Path(__file__).resolve().parent / "mailwatch.sh"
+    print(f"Process the above (read/ack each), then arm the watch:\n"
+          f"  {watch_path} {role} {highest}")
+
+
+def _cmd_whoami(args) -> None:
+    print(resolve_role(args.role))
+
+
+def _cmd_pending(args) -> None:
+    role = resolve_role(args.role or args.legacy_role)
+    pending = pending_for_role(role)
+    # A positional role (the old `relay.py pending <role>` shape) is an
+    # old-style caller; give it the old always-JSON output it depends on,
+    # not the new short-by-default format.
+    if args.full or args.legacy_role:
+        print(json.dumps(pending, indent=2))
+        return
+    if not pending:
+        print("No pending mail.")
+        return
+    for m in pending:
+        print(f"#{m['message_id']} thread {m['thread_id']} \"{m['topic']}\" "
+              f"from {m['sender_role']}: {_preview(m['body'])}")
+
+
+def _cmd_read(args) -> None:
+    mark_read(args.message_id, resolve_role(args.role or args.legacy_role))
+
+
+def _cmd_ack(args) -> None:
+    ack_message(args.message_id, resolve_role(args.role or args.legacy_role))
+
+
+def _cmd_post(args) -> None:
+    role = resolve_role(args.role)
+    body = _read_body(args)
+    needs_operator = (args.needs_operator[0], args.needs_operator[1]) if args.needs_operator else None
+    message_id, recipients = log_message(args.thread_id, role, body, needs_operator=needs_operator,
+                                          answers=args.answers)
+    print(f"posted #{message_id} to thread {args.thread_id}, recipients: {', '.join(recipients) or '(none)'}")
+
+
+def _cmd_new_thread(args) -> None:
+    role = resolve_role(args.role)
+    members = sorted({role, *args.members})
+    group_id, existing = create_or_get_group(members)
+    thread_id = create_thread(group_id, args.topic)
+    print(f"group {group_id} ({'existing' if existing else 'new'}, members: {', '.join(members)}), "
+          f"thread {thread_id}: \"{args.topic}\"")
+
+
+def _cmd_history(args) -> None:
+    messages = get_thread_history(args.thread_id)
+    if args.full:
+        print(json.dumps(messages, indent=2))
+        return
+    for m in messages:
+        acked = f" (acked by {', '.join(m['acked_by'])})" if m.get("acked_by") else ""
+        print(f"#{m['message_id']} {m['created_at']} {m['sender_role']}: {_preview(m['body'])}{acked}")
+
+
+def _cmd_attention(args) -> None:
+    open_asks = open_attention()
+    if args.full:
+        print(json.dumps(open_asks, indent=2))
+        return
+    if not open_asks:
+        print("No open needs_operator asks.")
+        return
+    for a in open_asks:
+        print(f"#{a['message_id']} thread {a['thread_id']} [{a['attn_kind']}] "
+              f"from {a['sender_role']}: {a['attn_why']}")
+
+
+def _cli() -> None:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--role", help="Override the resolved RELAY_ROLE / .relay-role (rarely needed).")
+    p.add_argument("--out", metavar="PATH",
+                    help="Write this command's output to a file instead of stdout -- for large "
+                         "results (e.g. `history --full` on a long thread) that would otherwise "
+                         "get truncated by a caller's own output-capture limit, so nothing ever "
+                         "has reason to fall back to raw curl for that (architect-claude, msg 1006).")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    # High-level commands -- role comes from RELAY_ROLE / .relay-role.
+    st = sub.add_parser("start", help="bind + show pending mail + print the mailwatch command")
+    st.add_argument("session_name", help="current ListAgents session name")
+    st.set_defaults(func=_cmd_start)
+
+    wa = sub.add_parser("whoami", help="print the resolved role")
+    wa.set_defaults(func=_cmd_whoami)
+
+    pd = sub.add_parser("pending", help="your unread mail (short by default)")
+    pd.add_argument("legacy_role", nargs="?",
+                     help=argparse.SUPPRESS)  # old relay.py CLI: `pending <role>`
+    pd.add_argument("--full", action="store_true", help="print full JSON instead of one line per message")
+    pd.set_defaults(func=_cmd_pending)
+
+    rd = sub.add_parser("read", help="mark a message processed")
+    rd.add_argument("message_id", type=int)
+    rd.add_argument("legacy_role", nargs="?",
+                     help=argparse.SUPPRESS)  # old relay.py CLI: `read <message_id> <role>`
+    rd.set_defaults(func=_cmd_read)
+
+    ak = sub.add_parser("ack", help="info-only thumbs-up, no reply needed")
+    ak.add_argument("message_id", type=int)
+    ak.add_argument("legacy_role", nargs="?",
+                     help=argparse.SUPPRESS)  # old relay.py CLI: `ack <message_id> <role>`
+    ak.set_defaults(func=_cmd_ack)
+
+    po = sub.add_parser("post", help="post into a thread")
+    po.add_argument("thread_id", type=int)
+    po.add_argument("text", nargs="*", help="body text (or use --file / stdin)")
+    po.add_argument("--file", help="read the body from this file")
+    po.add_argument("--needs-operator", nargs=2, metavar=("KIND", "WHY"),
+                     help="flag for the operator: KIND is decision/approval/security/bug/other, WHY is one line <=200 chars")
+    po.add_argument("--answers", type=int, help="message_id this reply answers (the operator's replies only)")
+    po.set_defaults(func=_cmd_post)
+
+    nt = sub.add_parser("new-thread", help="get-or-create a group, then start a thread in it")
+    nt.add_argument("topic")
+    nt.add_argument("--members", nargs="*", default=[], help="other roles besides your own")
+    nt.set_defaults(func=_cmd_new_thread)
+
+    hi = sub.add_parser("history", help="a thread's full history (short by default)")
+    hi.add_argument("thread_id", type=int)
+    hi.add_argument("--full", action="store_true", help="print full JSON instead of one line per message")
+    hi.set_defaults(func=_cmd_history)
+
+    at = sub.add_parser("attention", help="open needs_operator asks (coordinator-claude/dashboard use)")
+    at.add_argument("--full", action="store_true")
+    at.set_defaults(func=_cmd_attention)
+
+    # Low-level commands -- explicit role/member args, kept for anything
+    # that acts on another role's behalf (e.g. coordinator-claude's arbitrator
+    # duties) or needs the raw primitives.
+    b = sub.add_parser("bind"); b.add_argument("role"); b.add_argument("session_name")
+    b.set_defaults(func=lambda a: bind_role(a.role, a.session_name))
+    wi = sub.add_parser("whois"); wi.add_argument("role")
+    wi.set_defaults(func=lambda a: print(json.dumps(get_role_binding(a.role))))
+    cg = sub.add_parser("create-group"); cg.add_argument("members", nargs="+")
+    cg.set_defaults(func=lambda a: print(json.dumps(create_group(a.members))))
+    dg = sub.add_parser("delete-group"); dg.add_argument("group_id", type=int)
+    dg.set_defaults(func=lambda a: delete_group(a.group_id))
+    gm = sub.add_parser("members"); gm.add_argument("group_id", type=int)
+    gm.set_defaults(func=lambda a: print(json.dumps(group_members(a.group_id))))
+    am = sub.add_parser("add-member"); am.add_argument("group_id", type=int); am.add_argument("role")
+    am.set_defaults(func=lambda a: add_member(a.group_id, a.role))
+    ct = sub.add_parser("create-thread"); ct.add_argument("group_id", type=int); ct.add_argument("topic")
+    ct.set_defaults(func=lambda a: print(json.dumps(create_thread(a.group_id, a.topic))))
+    ft = sub.add_parser("find-thread"); ft.add_argument("group_id", type=int); ft.add_argument("topic")
+    ft.set_defaults(func=lambda a: print(json.dumps(find_thread_by_topic(a.group_id, a.topic))))
+    ti = sub.add_parser("thread-info"); ti.add_argument("thread_id", type=int)
+    ti.set_defaults(func=lambda a: print(json.dumps(get_thread_info(a.thread_id))))
+    lm = sub.add_parser("log"); lm.add_argument("thread_id", type=int); lm.add_argument("sender"); lm.add_argument("body")
+    def _log(a):
+        message_id, recipients = log_message(a.thread_id, a.sender, a.body)
+        print(json.dumps({"message_id": message_id, "recipients": recipients}))
+    lm.set_defaults(func=_log)
+    md = sub.add_parser("delivered"); md.add_argument("message_id", type=int); md.add_argument("role")
+    md.set_defaults(func=lambda a: mark_delivered(a.message_id, a.role))
+    mdb = sub.add_parser("delivered-batch"); mdb.add_argument("message_id", type=int); mdb.add_argument("roles", nargs="+")
+    mdb.set_defaults(func=lambda a: mark_delivered_batch(a.message_id, a.roles))
+    ar = sub.add_parser("archive-thread"); ar.add_argument("thread_id", type=int)
+    ar.set_defaults(func=lambda a: archive_thread(a.thread_id))
+    ca = sub.add_parser("clear-attention"); ca.add_argument("message_id", type=int)
+    ca.set_defaults(func=lambda a: clear_attention(a.message_id))
+
+    args = p.parse_args()
+    try:
+        if args.out:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                args.func(args)
+            Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+            Path(args.out).write_text(buf.getvalue())
+            print(f"wrote {len(buf.getvalue())} bytes to {args.out}")
+        else:
+            args.func(args)
+    except RelayError as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    _cli()
