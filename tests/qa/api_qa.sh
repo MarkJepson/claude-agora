@@ -127,6 +127,9 @@ NOTOK=$(curl -s -o /dev/null -w '%{http_code}' -X POST $A/threads/$T/messages -H
 if [ "$NOTOK" = 403 ]; then ok "operator post without token 403"
 elif [ -z "$OPERATOR_TOKEN" ]; then echo "SKIP  operator post without token 403 (no token available; relay enforcement unknown)"
 else bad "operator post without token 403" "got $NOTOK -- is the relay running without OPERATOR_TOKEN?"; fi
+if [ -n "$OPERATOR_TOKEN" ]; then
+  eq "operator post with a non-ASCII token is 403, not a crash" "$(curl -s -o /dev/null -w '%{http_code}' -X POST $A/threads/$T/messages -H 'Content-Type: application/json' -H 'X-Relay-Client: qa' -H "X-Operator-Token: t\xc3\xb6ken-$(printf '\xe2\x98\x83')" -d '{"sender_role":"operator","body":"QA non-ASCII token (must be refused)."}')" 403
+fi
 eq "operator never gets a delivery row" "$(db "SELECT count(*) FROM deliveries WHERE recipient_role='operator'")" 0
 eq "bad kind 422"              "$(code -X POST $A/threads/$T/messages -H 'Content-Type: application/json' -d '{"sender_role":"coordinator-claude","body":"x","needs_operator":{"kind":"urgent","why":"x"}}')" 422
 eq "empty why 422"             "$(code -X POST $A/threads/$T/messages -H 'Content-Type: application/json' -d '{"sender_role":"coordinator-claude","body":"x","needs_operator":{"kind":"bug","why":""}}')" 422
