@@ -13,6 +13,7 @@ What it does for callers:
   * `retry_on_db_error` re-runs a whole request handler after a deadlock.
 
 DATABASE_URL: mysql://user:password@host:3306/dbname[?ssl=true][&ssl_ca=/path/ca.pem]
+[&ssl_cert=/path/client.pem&ssl_key=/path/client-key.pem]
 (`mariadb://` is accepted too). Percent-encode any of @ / : % in the password,
 or leave it out of the URL and put it in DATABASE_PASSWORD, which wins.
 Message ids come from AUTO_INCREMENT, and the mail watch's "highest message_id
@@ -25,6 +26,7 @@ import logging
 import os
 import re
 import ssl
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -137,11 +139,50 @@ class Conn:
 
 
 class Pool:
-    def __init__(self, pool: aiomysql.Pool):
-        self._p = pool
+    """aiomysql pool that rebuilds itself when its TLS files change on disk, so
+    a rotated client certificate / CA bundle is picked up without a restart."""
+
+    def __init__(self, make_kwargs, watched: list[str]):
+        self._make_kwargs = make_kwargs
+        self._watched = watched
+        self._p: Optional[aiomysql.Pool] = None
+        self._stamp: tuple = ()
+        self._lock = asyncio.Lock()
+        self._next_reload_try = 0.0
+
+    def _stat(self) -> tuple:
+        out = []
+        for f in self._watched:
+            try:
+                out.append(os.stat(f).st_mtime_ns)  # follows symlinks (mounted Secrets)
+            except OSError:
+                out.append(None)
+        return tuple(out)
+
+    async def _open(self) -> aiomysql.Pool:
+        return await aiomysql.create_pool(**self._make_kwargs())
+
+    async def _maybe_reload(self) -> None:
+        if not self._watched or self._stat() == self._stamp:
+            return
+        async with self._lock:
+            stamp = self._stat()
+            if stamp == self._stamp or time.monotonic() < self._next_reload_try:
+                return
+            try:
+                new = await self._open()
+            except Exception as e:  # files may be mid-rotation: keep serving, retry shortly
+                self._next_reload_try = time.monotonic() + 10
+                log.error("TLS files changed but the new pool failed to open (%s); keeping the current one", e)
+                return
+            old, self._p, self._stamp = self._p, new, stamp
+            log.info("TLS files changed; database pool rebuilt with the new certificates")
+            old.close()
+            asyncio.create_task(old.wait_closed())
 
     @asynccontextmanager
     async def acquire(self):
+        await self._maybe_reload()
         async with self._p.acquire() as raw:
             # A pooled connection can have been dropped by a server restart or
             # a proxy idle timeout; reconnect instead of failing.
@@ -153,35 +194,52 @@ class Pool:
         await self._p.wait_closed()
 
 
-async def create_pool(url: str, min_size: int = 1, max_size: int = 5, wait_seconds: int = 60) -> Pool:
+def _ssl_context(q: dict):
+    wants_tls = q.get("ssl", ["false"])[0].lower() in ("1", "true", "yes")
+    if not (q.get("ssl_ca") or q.get("ssl_cert") or wants_tls):
+        return None
+    # Verifies the server certificate and hostname; ssl_cert/ssl_key add a
+    # client certificate for servers that require one. ssl_check_hostname=false
+    # keeps the certificate-chain check but skips the name match (only for a
+    # server whose certificate names don't cover the host you connect to).
+    ctx = ssl.create_default_context(cafile=q["ssl_ca"][0] if q.get("ssl_ca") else None)
+    if q.get("ssl_check_hostname", ["true"])[0].lower() in ("0", "false", "no"):
+        ctx.check_hostname = False
+    if q.get("ssl_cert"):
+        ctx.load_cert_chain(q["ssl_cert"][0], q.get("ssl_key", [None])[0])
+    return ctx
+
+
+async def create_pool(url: str, min_size: int = 1, max_size: int = 4, wait_seconds: int = 60) -> Pool:
     u = urlparse(url)
     if u.scheme not in ("mysql", "mariadb"):
         raise ValueError(f"DATABASE_URL must be mysql://... (got scheme {u.scheme!r})")
     q = parse_qs(u.query)
-    ctx = None
-    if q.get("ssl_ca"):
-        ctx = ssl.create_default_context(cafile=q["ssl_ca"][0])
-    elif q.get("ssl", ["false"])[0].lower() in ("1", "true", "yes"):
-        ctx = ssl.create_default_context()
-    kwargs = dict(
-        host=u.hostname or "localhost",
-        port=u.port or 3306,
-        user=unquote(u.username or ""),
-        password=os.environ.get("DATABASE_PASSWORD") or unquote(u.password or ""),
-        db=(u.path or "/").lstrip("/"),
-        minsize=min_size,
-        maxsize=max_size,
-        autocommit=True,
-        charset="utf8mb4",
-        client_flag=CLIENT.FOUND_ROWS,
-        init_command="SET time_zone = '+00:00'",
-        pool_recycle=280,
-        ssl=ctx,
-    )
+
+    def make_kwargs() -> dict:
+        return dict(
+            host=u.hostname or "localhost",
+            port=u.port or 3306,
+            user=unquote(u.username or ""),
+            password=os.environ.get("DATABASE_PASSWORD") or unquote(u.password or ""),
+            db=(u.path or "/").lstrip("/"),
+            minsize=min_size,
+            maxsize=max_size,
+            autocommit=True,
+            charset="utf8mb4",
+            client_flag=CLIENT.FOUND_ROWS,
+            init_command="SET time_zone = '+00:00'",
+            pool_recycle=280,
+            ssl=_ssl_context(q),  # re-read from disk on every (re)build
+        )
+
+    pool = Pool(make_kwargs, [f for k in ("ssl_ca", "ssl_cert", "ssl_key") for f in q.get(k, [])])
     # The DB may still be starting (compose, or a pod scheduled before it).
     for attempt in range(1, max(1, wait_seconds // 2) + 1):
         try:
-            return Pool(await aiomysql.create_pool(**kwargs))
+            pool._stamp = pool._stat()
+            pool._p = await pool._open()
+            return pool
         except (pymysql.err.OperationalError, OSError) as e:
             if attempt * 2 >= wait_seconds:
                 raise
@@ -190,16 +248,46 @@ async def create_pool(url: str, min_size: int = 1, max_size: int = 5, wait_secon
     raise RuntimeError("unreachable")
 
 
-async def apply_schema(conn: Conn, path: Path) -> None:
-    """Runs schema.sql; every statement is idempotent (IF NOT EXISTS / INSERT
-    IGNORE), so this is safe on every startup."""
+_CREATE_TABLE = re.compile(r"CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+`?(\w+)`?", re.I)
+_CREATE_INDEX = re.compile(r"CREATE\s+INDEX\s+IF\s+NOT\s+EXISTS\s+`?(\w+)`?\s+ON\s+`?(\w+)`?", re.I)
+_ADD_COLUMN = re.compile(r"ALTER\s+TABLE\s+`?(\w+)`?\s+ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+`?(\w+)`?", re.I)
+
+
+async def _already_applied(conn: "Conn", stmt: str) -> bool:
+    """True if this DDL statement would be a no-op. Some database setups
+    replicate DDL to every node and briefly block other clients while it runs, so
+    a start with nothing to change must not send any, not even an IF NOT EXISTS."""
+    m = _CREATE_TABLE.match(stmt)
+    if m:
+        return bool(await conn.fetchval(
+            "SELECT 1 FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = $1", m.group(1)))
+    m = _CREATE_INDEX.match(stmt)
+    if m:
+        return bool(await conn.fetchval(
+            "SELECT 1 FROM information_schema.statistics WHERE table_schema = DATABASE() "
+            "AND table_name = $1 AND index_name = $2 LIMIT 1", m.group(2), m.group(1)))
+    m = _ADD_COLUMN.match(stmt)
+    if m:
+        return bool(await conn.fetchval(
+            "SELECT 1 FROM information_schema.columns WHERE table_schema = DATABASE() "
+            "AND table_name = $1 AND column_name = $2", m.group(1), m.group(2)))
+    return False
+
+
+async def apply_schema(conn: Conn, path: Path) -> int:
+    """Applies schema.sql, skipping any DDL that is already in place. Returns
+    the number of DDL statements actually sent (0 on an up-to-date database).
+    Every statement must stay idempotent (IF NOT EXISTS / INSERT IGNORE)."""
     text = "\n".join(l for l in path.read_text().splitlines() if not l.strip().startswith("--"))
+    sent = 0
     for stmt in (s.strip() for s in text.split(";")):
-        if not stmt:
+        if not stmt or await _already_applied(conn, stmt):
             continue
+        is_ddl = not stmt.upper().startswith("INSERT")
         for attempt in range(1, 6):
             try:
                 await conn.execute(stmt)
+                sent += is_ddl
                 break
             except pymysql.err.MySQLError as e:
                 code = e.args[0] if e.args and isinstance(e.args[0], int) else None
@@ -207,6 +295,8 @@ async def apply_schema(conn: Conn, path: Path) -> None:
                     raise
                 log.warning("schema statement hit DB error %s (attempt %d); retrying", code, attempt)
                 await asyncio.sleep(0.5 * attempt)
+    log.info("schema applied: %d DDL statement(s) sent", sent)
+    return sent
 
 
 def retry_on_db_error(fn, attempts: int = 3):

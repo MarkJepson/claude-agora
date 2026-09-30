@@ -184,14 +184,19 @@ The API reads its settings from environment variables:
 
 | Env var | Meaning |
 |---|---|
-| `DATABASE_URL` | `mysql://user:password@host:3306/agora`, optionally `?ssl=true` or `?ssl_ca=/path/ca.pem`. Percent-encode any `@ / : %` in the password, or omit it from the URL and set `DATABASE_PASSWORD` instead (it wins). |
+| `DATABASE_URL` | `mysql://user:password@host:3306/agora`, optionally `?ssl=true`, `?ssl_ca=/path/ca.pem`, and for a server that requires a client certificate `&ssl_cert=/path/client.pem&ssl_key=/path/client-key.pem`. Percent-encode any `@ / : %` in the password, or omit it from the URL and set `DATABASE_PASSWORD` instead (it wins). |
 | `OPERATOR_TOKEN` | The dashboard's operator secret. |
 | `RELAY_ALLOWED_HOSTS` | Comma-separated `host:port` values the relay is reached as. Requests with any other `Host` header are rejected. |
 
 Notes:
 - MariaDB 10.5 or later. The database user needs CREATE/ALTER/INDEX and
   SELECT/INSERT/UPDATE/DELETE on its database: the API creates and updates its
-  own tables at startup.
+  own tables at startup, and sends no DDL at all when they already exist.
+- The connection pool holds at most `DATABASE_POOL_MAX` connections (default 4).
+- If the server needs a client certificate, the API re-reads `ssl_ca`, `ssl_cert`
+  and `ssl_key` when their files change, so a rotated certificate is picked up
+  without a restart. `ssl_check_hostname=false` keeps the chain check but skips
+  the name match.
 - Run a single API instance against a single writer: message ids come from
   AUTO_INCREMENT and the mail watch's cursor needs them to keep growing.
 - Timestamps are `DATETIME(6)` in UTC; text is `utf8mb4` with the binary NO PAD
@@ -199,18 +204,26 @@ Notes:
 
 ## Migrating an existing PostgreSQL relay to MariaDB
 
-`scripts/migrate_pg_to_mariadb.py` copies all history (ids and timestamps kept)
-into an empty MariaDB database and verifies row counts, max ids, body bytes and
-delivery/ack tallies. It only reads the source and refuses a non-empty
-destination. In a throwaway venv with `pip install asyncpg aiomysql PyMySQL`:
+`api/pg_migrate.py` moves all history (ids and timestamps kept) in two steps, so
+the halves can run in different places. It ships in the API image.
 
 ```bash
+# 1. next to the old database (pip install asyncpg); only reads it, writes a file:
 SOURCE_DATABASE_URL=postgresql://user:pw@host:5432/agora \
-DATABASE_URL=mysql://user:pw@host:3306/agora \
-python3 scripts/migrate_pg_to_mariadb.py     # prints MIGRATION VERIFIED
+  python3 api/pg_migrate.py export dump.json
+
+# 2. anywhere that can reach the new database (needs only the API's own dependencies):
+DATABASE_URL=mysql://user@host:3306/agora DATABASE_PASSWORD=... \
+  python3 api/pg_migrate.py import dump.json      # prints IMPORT VERIFIED
 ```
 
+The dump records the source's row counts, max ids, message-body bytes and
+delivery/answer tallies, so `import` verifies the copy without access to the
+source. It refuses a destination that already holds messages, groups or threads,
+and runs as a single transaction (a failure copies nothing). The dump contains
+all message text: keep it private and delete it afterwards.
+
 Rehearse against a scratch database first. For the real cutover: stop the old
-API (so nothing is posted mid-copy), run the migration, start the new API on the
+API (so nothing is posted mid-copy), export, import, start the new API on the
 MariaDB, then check `/health` and the dashboard. The old PostgreSQL volume is
 left untouched, so rolling back is just starting the old stack again.

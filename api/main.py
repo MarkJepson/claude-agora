@@ -141,7 +141,7 @@ async def startup() -> None:
             "OPERATOR_TOKEN not set -- sender_role='operator' is NOT restricted to the dashboard yet. "
             "Set OPERATOR_TOKEN (e.g. in a gitignored .env) and configure it in the dashboard to enforce this."
         )
-    pool = await agora_db.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    pool = await agora_db.create_pool(DATABASE_URL, min_size=1, max_size=int(os.environ.get("DATABASE_POOL_MAX", "4")))
     async with pool.acquire() as conn:
         await agora_db.apply_schema(conn, SCHEMA_PATH)
 
