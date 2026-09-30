@@ -27,6 +27,16 @@ function findChromium() {
   }
   return join(cacheDir, candidates[0], 'chrome-headless-shell-linux64', 'chrome-headless-shell');
 }
+// The dashboard needs OPERATOR_TOKEN to post as operator (Mark enters it once;
+// it lives in sessionStorage). Same source as api_qa.sh: env, else gitignored .env.
+function operatorToken() {
+  if (process.env.OPERATOR_TOKEN) return process.env.OPERATOR_TOKEN;
+  try {
+    const m = readFileSync(join(DIR, '..', '..', '.env'), 'utf8').match(/^OPERATOR_TOKEN=(.*)$/m);
+    return m ? m[1].trim().replace(/^["']|["']$/g, '') : '';
+  } catch (e) { return ''; }
+}
+const OPERATOR_TOKEN = operatorToken();
 const CH = findChromium();
 const PORT = 9333;
 let pass = 0, fail = 0;
@@ -95,6 +105,7 @@ try {
 
   console.log('== load');
   await go(BASE + '/dashboard');
+  if (OPERATOR_TOKEN) await ev(`sessionStorage.setItem('relay_operator_token', ${JSON.stringify(OPERATOR_TOKEN)})`);
   check('page reaches Live', await until(`document.querySelector('.conn-strong')?.textContent === 'Live'`), 'never Live');
   check('thread list rendered', await ev(`document.querySelectorAll('.rl-trow').length > 0`), 'few rows');
   check('roles panel has Last seen column', await ev(`document.querySelector('.roles-colhead').textContent.includes('Last seen')`), 'missing');

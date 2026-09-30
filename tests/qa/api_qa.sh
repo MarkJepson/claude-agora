@@ -13,12 +13,18 @@ DIR=$(cd "$(dirname "$0")" && pwd)
 REPO_ROOT=$(cd "$DIR/../.." && pwd)
 W="$REPO_ROOT/scripts/mailwatch.sh"
 ME=coordinator-claude
+# The relay enforces OPERATOR_TOKEN for sender_role=operator posts and attention
+# clears (403 without it). Use the same secret the relay was started with:
+# from the environment, else the gitignored .env. Never printed.
+OPERATOR_TOKEN=${OPERATOR_TOKEN:-$(sed -n 's/^OPERATOR_TOKEN=//p' "$REPO_ROOT/.env" 2>/dev/null | head -1 | tr -d "\"'")}
+OPH=(); [ -n "$OPERATOR_TOKEN" ] && OPH=(-H "X-Operator-Token: $OPERATOR_TOKEN")
+[ -n "$OPERATOR_TOKEN" ] || echo "WARNING: no OPERATOR_TOKEN (env or .env): operator-post cases will 403 if the relay enforces it." >&2
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "PASS  $1"; }
 bad()  { FAIL=$((FAIL+1)); echo "FAIL  $1  -- $2"; }
 eq()   { [ "$2" = "$3" ] && ok "$1" || bad "$1" "expected [$3] got [$2]"; }
-code() { curl -s -o /tmp/qa_body -w '%{http_code}' -H 'X-Relay-Client: qa' "$@"; }
-post() { curl -s -X POST "$A$1" -H 'Content-Type: application/json' -H 'X-Relay-Client: qa' -d "$2"; }
+code() { curl -s -o /tmp/qa_body -w '%{http_code}' -H 'X-Relay-Client: qa' ${OPH[@]+"${OPH[@]}"} "$@"; }
+post() { curl -s -X POST "$A$1" -H 'Content-Type: application/json' -H 'X-Relay-Client: qa' ${OPH[@]+"${OPH[@]}"} -d "$2"; }
 db()   { (cd "$REPO_ROOT" && docker compose exec -T db psql -U agora -d agora -At -c "$1"); }
 mine() { curl -s "$A/roles/$ME/pending?peek=true" | jq -c "[.pending[] | select(.thread_id==$T) | .message_id]"; }
 
@@ -102,6 +108,7 @@ R=$(post /threads/$T/messages '{"sender_role":"operator","body":"QA plain messag
 M1=$(echo "$R" | jq -r .message_id)
 eq "operator's post reaches the member" "$(echo "$R" | jq -c .recipients)" "[\"$ME\"]"
 eq "post returns group_id"     "$(echo "$R" | jq -r .group_id)" "$G"
+[ -n "$OPERATOR_TOKEN" ] && eq "operator post without token 403" "$(curl -s -o /dev/null -w '%{http_code}' -X POST $A/threads/$T/messages -H 'Content-Type: application/json' -H 'X-Relay-Client: qa' -d '{"sender_role":"operator","body":"x"}')" 403
 eq "operator never gets a delivery row" "$(db "SELECT count(*) FROM deliveries WHERE recipient_role='operator'")" 0
 eq "bad kind 422"              "$(code -X POST $A/threads/$T/messages -H 'Content-Type: application/json' -d '{"sender_role":"coordinator-claude","body":"x","needs_operator":{"kind":"urgent","why":"x"}}')" 422
 eq "empty why 422"             "$(code -X POST $A/threads/$T/messages -H 'Content-Type: application/json' -d '{"sender_role":"coordinator-claude","body":"x","needs_operator":{"kind":"bug","why":""}}')" 422
