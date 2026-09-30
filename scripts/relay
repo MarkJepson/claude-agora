@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Shared client for the coordinator-claude relay API (Docker: postgres + FastAPI,
+"""Shared client for the coordinator-claude relay API (Docker: MariaDB + FastAPI,
 see docker-compose.yml). Requires `docker compose up -d` to be running.
 
 This is the client every session uses for ALL interactions with the

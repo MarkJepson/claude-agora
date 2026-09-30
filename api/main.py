@@ -1,4 +1,4 @@
-"""Claude Agora backing API: a small REST API + Postgres DB that lets many
+"""Claude Agora backing API: a small REST API + MariaDB database that lets many
 independent Claude Code sessions coordinate through durable groups and
 threads, instead of ad hoc peer-to-peer messages.
 
@@ -8,6 +8,7 @@ messages about one specific topic, and belongs to exactly one group.
 Membership lives on the group; topic and message history live on the
 thread.
 """
+import hashlib
 import hmac
 import html
 import logging
@@ -16,12 +17,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal, Optional
 
-import asyncpg
+import agora_db
+from agora_db import ph, retry_on_db_error
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 DATABASE_URL = os.environ["DATABASE_URL"]
+SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 STATIC_DIR = Path(__file__).parent / "static"
 # The operator isn't a role (design decision, 2026-09-26): they see every
 # group, thread and message through the dashboard, so the operator is never
@@ -38,7 +41,7 @@ def _reject_operator(role: str, what: str) -> None:
         raise HTTPException(422, f"'{OPERATOR}' can't {what}: the operator isn't a role; they see every thread on the dashboard")
 
 app = FastAPI(title="Claude Agora relay API")
-pool: Optional[asyncpg.Pool] = None
+pool: Optional[agora_db.Pool] = None
 
 # --- CSRF hardening ---
 # The relay has no auth and trusts any sender_role on localhost (documented
@@ -108,115 +111,7 @@ def _check_operator_token(request: Request, what: str = "this") -> None:
         raise HTTPException(403, f"{what} requires a valid X-Operator-Token header")
 
 
-async def _migrate_groups_topic_to_threads(conn: asyncpg.Connection) -> None:
-    """Idempotent: safe to run on every startup. No-ops once groups.topic
-    is gone. Exists here (not as a one-off script run by hand) because
-    schema changes need to survive a container rebuild without a manual
-    psql write -- auto-mode's permission classifier blocks raw mutating
-    SQL run directly against the DB, rebuild-and-restart is not."""
-    has_topic_column = await conn.fetchval(
-        """SELECT 1 FROM information_schema.columns
-           WHERE table_name = 'groups' AND column_name = 'topic'"""
-    )
-    if not has_topic_column:
-        return
-
-    async with conn.transaction():
-        await conn.execute(
-            """CREATE TABLE IF NOT EXISTS threads (
-                   thread_id    SERIAL PRIMARY KEY,
-                   group_id     INTEGER NOT NULL REFERENCES groups(group_id),
-                   topic        TEXT NOT NULL,
-                   status       TEXT NOT NULL DEFAULT 'active',
-                   created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-                   created_from TEXT
-               )"""
-        )
-        # One thread per pre-existing group, carrying that group's old topic/status.
-        await conn.execute(
-            """INSERT INTO threads (group_id, topic, status, created_at, created_from)
-               SELECT group_id, topic, status, created_at, created_from FROM groups
-               WHERE NOT EXISTS (SELECT 1 FROM threads t WHERE t.group_id = groups.group_id)"""
-        )
-        await conn.execute(
-            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS thread_id INTEGER REFERENCES threads(thread_id)"
-        )
-        await conn.execute(
-            """UPDATE messages m SET thread_id = t.thread_id
-               FROM threads t WHERE t.group_id = m.group_id AND m.thread_id IS NULL"""
-        )
-        await conn.execute("ALTER TABLE messages ALTER COLUMN thread_id SET NOT NULL")
-        await conn.execute("ALTER TABLE messages DROP COLUMN group_id")
-        await conn.execute("ALTER TABLE groups DROP COLUMN topic")
-
-
-async def _migrate_add_ack_column(conn: asyncpg.Connection) -> None:
-    """Idempotent. ack_at is the 'thumbs up' signal (2026-09-17): a
-    recipient can flag a message as info-only / no-action-needed without
-    posting a full reply message. Distinct from read_at, which just means
-    'processed' as part of the pending pull-and-ack flow."""
-    await conn.execute("ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS ack_at TIMESTAMPTZ")
-
-
-async def _migrate_add_attention(conn: asyncpg.Connection) -> None:
-    """Idempotent. needs_operator flag (2026-09-25): a session posting a
-    message can ask for the operator's attention with a kind + a short why,
-    instead of the dashboard guessing from body text. The operator answers
-    by posting as the 'operator' role with `answers`, or clears it without
-    replying."""
-    await conn.execute(
-        """ALTER TABLE messages
-             ADD COLUMN IF NOT EXISTS attn_kind TEXT,
-             ADD COLUMN IF NOT EXISTS attn_why TEXT,
-             ADD COLUMN IF NOT EXISTS attn_answered_by INTEGER REFERENCES messages(message_id),
-             ADD COLUMN IF NOT EXISTS attn_cleared_at TIMESTAMPTZ"""
-    )
-    # Sender identity for the operator's dashboard posts only; see OPERATOR.
-    await conn.execute("INSERT INTO roles (role) VALUES ('operator') ON CONFLICT DO NOTHING")
-    await conn.execute(
-        "CREATE INDEX IF NOT EXISTS messages_attn_idx ON messages (message_id) WHERE attn_kind IS NOT NULL"
-    )
-
-
-async def _migrate_add_last_seen(conn: asyncpg.Connection) -> None:
-    """Idempotent. Last seen (design decision, 2026-09-25): when a role last touched
-    the API as itself (bind, post, read, ack, pending pull), for the
-    dashboard's Roles panel. Backfilled once from existing history; mail
-    checks before this change left no trace, so the backfill can be older
-    than reality."""
-    await conn.execute(
-        """ALTER TABLE roles
-             ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ,
-             ADD COLUMN IF NOT EXISTS last_seen_action TEXT"""
-    )
-    await conn.execute(
-        """UPDATE roles r SET last_seen_at = x.at, last_seen_action = 'from history'
-           FROM (SELECT role, MAX(at) AS at FROM (
-                   SELECT role, bound_at AS at FROM role_bindings
-                   UNION ALL SELECT sender_role, created_at FROM messages
-                   UNION ALL SELECT recipient_role, GREATEST(read_at, ack_at) FROM deliveries
-                 ) u WHERE at IS NOT NULL GROUP BY role) x
-           WHERE r.role = x.role AND r.last_seen_at IS NULL"""
-    )
-
-
-async def _migrate_add_heartbeat(conn: asyncpg.Connection) -> None:
-    """Idempotent. Watch heartbeat (design decision, 2026-09-26): mailwatch.sh posts a
-    heartbeat every loop, so the dashboard can tell a running watch from a
-    stopped one. A heartbeat counts as "seen" but isn't an action, so the
-    last real action and its time are kept separately."""
-    await conn.execute(
-        """ALTER TABLE roles
-             ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMPTZ,
-             ADD COLUMN IF NOT EXISTS heartbeat_interval INTEGER,
-             ADD COLUMN IF NOT EXISTS last_action_at TIMESTAMPTZ"""
-    )
-    await conn.execute(
-        "UPDATE roles SET last_action_at = last_seen_at WHERE last_action_at IS NULL AND last_seen_at IS NOT NULL"
-    )
-
-
-async def _touch(conn: asyncpg.Connection, role: str, action: str) -> None:
+async def _touch(conn: agora_db.Conn, role: str, action: str) -> None:
     """Record that `role` itself just used the API. Only for calls a role
     makes as itself -- not delivered/delivered-batch, which coordinator-claude
     makes about other roles, and not GET /roles/{role}, a lookup anyone
@@ -227,11 +122,11 @@ async def _touch(conn: asyncpg.Connection, role: str, action: str) -> None:
     )
 
 
-async def _require_roles_exist(conn: asyncpg.Connection, roles: list[str]) -> None:
+async def _require_roles_exist(conn: agora_db.Conn, roles: list[str]) -> None:
     """Roles are FK-referenced everywhere (role_bindings, group_members,
     messages.sender_role); without this check an unregistered role hits a
     raw ForeignKeyViolationError and surfaces as a 500 instead of a 404."""
-    rows = await conn.fetch("SELECT role FROM roles WHERE role = ANY($1::text[])", roles)
+    rows = await conn.fetch(f"SELECT role FROM roles WHERE role IN ({ph(1, len(roles))})", *roles)
     known = {r["role"] for r in rows}
     missing = [r for r in roles if r not in known]
     if missing:
@@ -246,13 +141,9 @@ async def startup() -> None:
             "OPERATOR_TOKEN not set -- sender_role='operator' is NOT restricted to the dashboard yet. "
             "Set OPERATOR_TOKEN (e.g. in a gitignored .env) and configure it in the dashboard to enforce this."
         )
-    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    pool = await agora_db.create_pool(DATABASE_URL, min_size=1, max_size=5)
     async with pool.acquire() as conn:
-        await _migrate_groups_topic_to_threads(conn)
-        await _migrate_add_ack_column(conn)
-        await _migrate_add_attention(conn)
-        await _migrate_add_last_seen(conn)
-        await _migrate_add_heartbeat(conn)
+        await agora_db.apply_schema(conn, SCHEMA_PATH)
 
 
 @app.on_event("shutdown")
@@ -305,6 +196,7 @@ class DeliveredBatchRequest(BaseModel):
 
 
 @app.post("/roles/{role}/bind")
+@retry_on_db_error
 async def bind_role(role: str, req: BindRequest):
     """One live session per repo: if this session_name is currently the
     live binding for some OTHER role, that binding is superseded and
@@ -324,9 +216,9 @@ async def bind_role(role: str, req: BindRequest):
             await conn.execute(
                 """INSERT INTO role_bindings (role, session_name, bound_at, status)
                    VALUES ($1, $2, $3, 'live')
-                   ON CONFLICT (role) DO UPDATE SET
-                     session_name = excluded.session_name,
-                     bound_at = excluded.bound_at,
+                   ON DUPLICATE KEY UPDATE
+                     session_name = VALUES(session_name),
+                     bound_at = VALUES(bound_at),
                      status = 'live'""",
                 role, req.session_name, _now(),
             )
@@ -335,6 +227,7 @@ async def bind_role(role: str, req: BindRequest):
 
 
 @app.post("/roles/{role}/heartbeat")
+@retry_on_db_error
 async def heartbeat(role: str, interval: int = 20):
     """Sent by mailwatch.sh on every loop. Marks the role as seen and
     records the watch's poll interval, so the dashboard can flag a watch
@@ -375,6 +268,7 @@ async def get_role_binding(role: str):
 
 
 @app.post("/groups")
+@retry_on_db_error
 async def create_group(req: CreateGroupRequest):
     """Get or create the group for exactly this set of members. A group is
     a durable circle of member sessions with no topic of its own; if an
@@ -387,25 +281,31 @@ async def create_group(req: CreateGroupRequest):
     if not members:
         raise HTTPException(422, "members must not be empty")
     async with pool.acquire() as conn:
+        # Serialise concurrent requests for the same member set, so two
+        # callers can't both miss the lookup and create twins: an exclusive
+        # row lock per member set (not GET_LOCK, which is not shared between
+        # nodes of a replicated database). The row is created OUTSIDE the transaction: doing the
+        # INSERT IGNORE inside it takes a shared lock that the FOR UPDATE
+        # then upgrades, and racing callers deadlock.
+        lock_name = hashlib.md5(",".join(members).encode()).hexdigest()
+        await conn.execute("INSERT IGNORE INTO group_locks (name) VALUES ($1)", lock_name)
         async with conn.transaction():
-            # Serialise concurrent requests for the same member set, so two
-            # callers can't both miss the lookup and create twins.
-            await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", ",".join(members))
+            await conn.fetchval("SELECT name FROM group_locks WHERE name = $1 FOR UPDATE", lock_name)
             await _require_roles_exist(conn, members)
+            # Exactly these current members: as many active members as the
+            # request has, and all of them from the request.
             existing = await conn.fetchval(
-                """SELECT g.group_id FROM groups g
+                f"""SELECT g.group_id FROM `groups` g
                    JOIN group_members gm ON gm.group_id = g.group_id AND gm.left_at IS NULL
                    WHERE g.status = 'active'
                    GROUP BY g.group_id
-                   HAVING array_agg(gm.role ORDER BY gm.role) = $1::text[]
+                   HAVING COUNT(*) = $1 AND SUM(gm.role IN ({ph(2, len(members))})) = $1
                    ORDER BY g.group_id LIMIT 1""",
-                members,
+                len(members), *members,
             )
             if existing is not None:
                 return {"group_id": existing, "existing": True}
-            group_id = await conn.fetchval(
-                "INSERT INTO groups (created_from) VALUES (NULL) RETURNING group_id",
-            )
+            group_id = await conn.insert("INSERT INTO `groups` (created_from) VALUES (NULL)")
             for role in members:
                 await conn.execute(
                     "INSERT INTO group_members (group_id, role) VALUES ($1, $2)",
@@ -415,6 +315,7 @@ async def create_group(req: CreateGroupRequest):
 
 
 @app.delete("/groups/{group_id}")
+@retry_on_db_error
 async def delete_group(group_id: int):
     """Hard delete a group and everything under it (threads, messages,
     deliveries, membership) -- for cleaning up test/accidental groups
@@ -423,7 +324,7 @@ async def delete_group(group_id: int):
     that should never have existed at all."""
     async with pool.acquire() as conn:
         async with conn.transaction():
-            exists = await conn.fetchval("SELECT 1 FROM groups WHERE group_id = $1", group_id)
+            exists = await conn.fetchval("SELECT 1 FROM `groups` WHERE group_id = $1", group_id)
             if not exists:
                 raise HTTPException(404, f"group {group_id} does not exist")
             await conn.execute(
@@ -433,6 +334,13 @@ async def delete_group(group_id: int):
                        WHERE t.group_id = $1)""",
                 group_id,
             )
+            # attn_answered_by points at a message in the same thread; InnoDB
+            # checks foreign keys row by row, so unlink before deleting.
+            await conn.execute(
+                """UPDATE messages SET attn_answered_by = NULL WHERE thread_id IN (
+                       SELECT thread_id FROM threads WHERE group_id = $1)""",
+                group_id,
+            )
             await conn.execute(
                 """DELETE FROM messages WHERE thread_id IN (
                        SELECT thread_id FROM threads WHERE group_id = $1)""",
@@ -440,7 +348,7 @@ async def delete_group(group_id: int):
             )
             await conn.execute("DELETE FROM threads WHERE group_id = $1", group_id)
             await conn.execute("DELETE FROM group_members WHERE group_id = $1", group_id)
-            await conn.execute("DELETE FROM groups WHERE group_id = $1", group_id)
+            await conn.execute("DELETE FROM `groups` WHERE group_id = $1", group_id)
     return {"ok": True}
 
 
@@ -456,7 +364,7 @@ async def role_groups(role: str):
             raise HTTPException(404, f"role {role} does not exist")
         rows = await conn.fetch(
             "SELECT g.group_id, t.thread_id, t.topic "
-            "FROM group_members m JOIN groups g ON g.group_id = m.group_id "
+            "FROM group_members m JOIN `groups` g ON g.group_id = m.group_id "
             "LEFT JOIN threads t ON t.group_id = g.group_id AND t.status = 'active' "
             "WHERE m.role = $1 AND m.left_at IS NULL AND g.status = 'active' "
             "ORDER BY g.group_id, t.thread_id",
@@ -473,7 +381,7 @@ async def role_groups(role: str):
 @app.get("/groups/{group_id}/members")
 async def group_members(group_id: int):
     async with pool.acquire() as conn:
-        exists = await conn.fetchval("SELECT 1 FROM groups WHERE group_id = $1", group_id)
+        exists = await conn.fetchval("SELECT 1 FROM `groups` WHERE group_id = $1", group_id)
         if not exists:
             raise HTTPException(404, f"group {group_id} does not exist")
         rows = await conn.fetch(
@@ -484,34 +392,36 @@ async def group_members(group_id: int):
 
 
 @app.post("/groups/{group_id}/members")
+@retry_on_db_error
 async def add_member(group_id: int, req: AddMemberRequest):
     _reject_operator(req.role, "be a group member")
     async with pool.acquire() as conn:
         async with conn.transaction():
             await _require_roles_exist(conn, [req.role])
-            exists = await conn.fetchval("SELECT 1 FROM groups WHERE group_id = $1", group_id)
+            exists = await conn.fetchval("SELECT 1 FROM `groups` WHERE group_id = $1", group_id)
             if not exists:
                 raise HTTPException(404, f"group {group_id} does not exist")
-            # ON CONFLICT covers both a genuine re-add (no-op, already a
+            # ON DUPLICATE KEY covers both a genuine re-add (no-op, already a
             # member) and rejoining after having left (left_at is reset).
             await conn.execute(
                 """INSERT INTO group_members (group_id, role) VALUES ($1, $2)
-                   ON CONFLICT (group_id, role) DO UPDATE SET left_at = NULL""",
+                   ON DUPLICATE KEY UPDATE left_at = NULL""",
                 group_id, req.role,
             )
     return {"ok": True}
 
 
 @app.post("/groups/{group_id}/threads")
+@retry_on_db_error
 async def create_thread(group_id: int, req: CreateThreadRequest):
     """Start a new topic within an existing group -- mechanical, not a
     judgment call: the membership circle is already decided."""
     async with pool.acquire() as conn:
-        exists = await conn.fetchval("SELECT 1 FROM groups WHERE group_id = $1", group_id)
+        exists = await conn.fetchval("SELECT 1 FROM `groups` WHERE group_id = $1", group_id)
         if not exists:
             raise HTTPException(404, f"group {group_id} does not exist")
-        thread_id = await conn.fetchval(
-            "INSERT INTO threads (group_id, topic) VALUES ($1, $2) RETURNING thread_id",
+        thread_id = await conn.insert(
+            "INSERT INTO threads (group_id, topic) VALUES ($1, $2)",
             group_id, req.topic,
         )
     return {"thread_id": thread_id}
@@ -532,15 +442,16 @@ async def find_thread_by_topic(group_id: int, topic: str):
 
 
 @app.post("/threads/{thread_id}/archive")
+@retry_on_db_error
 async def archive_thread(thread_id: int):
     """Archiving is coordinator-claude's judgment call (same footing as creating
     a group/thread in the first place) -- once a topic is resolved, the
     thread is closed to new messages. Does not delete history."""
     async with pool.acquire() as conn:
-        result = await conn.execute(
+        matched = await conn.execute(
             "UPDATE threads SET status = 'archived' WHERE thread_id = $1", thread_id,
         )
-    if result == "UPDATE 0":
+    if matched == 0:
         raise HTTPException(404, f"thread {thread_id} does not exist")
     return {"ok": True}
 
@@ -562,6 +473,7 @@ async def get_thread_info(thread_id: int):
 
 
 @app.post("/threads/{thread_id}/messages")
+@retry_on_db_error
 async def log_message(thread_id: int, req: LogMessageRequest, request: Request):
     if req.sender_role == OPERATOR:
         _check_operator_token(request, "posting as 'operator'")
@@ -600,9 +512,9 @@ async def log_message(thread_id: int, req: LogMessageRequest, request: Request):
                 )
                 if target_thread != thread_id:
                     raise HTTPException(422, f"answers={req.answers} is not a message in thread {thread_id}")
-            message_id = await conn.fetchval(
+            message_id = await conn.insert(
                 """INSERT INTO messages (thread_id, sender_role, body, attn_kind, attn_why)
-                   VALUES ($1, $2, $3, $4, $5) RETURNING message_id""",
+                   VALUES ($1, $2, $3, $4, $5)""",
                 thread_id, req.sender_role, req.body,
                 req.needs_operator.kind if req.needs_operator else None,
                 req.needs_operator.why if req.needs_operator else None,
@@ -624,6 +536,7 @@ async def log_message(thread_id: int, req: LogMessageRequest, request: Request):
 
 
 @app.post("/messages/{message_id}/attention/clear")
+@retry_on_db_error
 async def clear_attention(message_id: int, request: Request):
     """The operator handled a needs_operator ask without posting a reply (e.g. they
     answered in a session directly). Same operator-only gate as `answers`
@@ -631,13 +544,12 @@ async def clear_attention(message_id: int, request: Request):
     role's open attention flag."""
     _check_operator_token(request, "clearing an attention flag")
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
+        cleared = await conn.execute(
             """UPDATE messages SET attn_cleared_at = $1
-               WHERE message_id = $2 AND attn_kind IS NOT NULL AND attn_cleared_at IS NULL
-               RETURNING message_id""",
+               WHERE message_id = $2 AND attn_kind IS NOT NULL AND attn_cleared_at IS NULL""",
             _now(), message_id,
         )
-    if row is None:
+    if cleared == 0:
         raise HTTPException(404, f"message {message_id} has no open needs_operator flag")
     return {"ok": True}
 
@@ -656,6 +568,7 @@ async def open_attention():
 
 
 @app.post("/messages/{message_id}/delivered")
+@retry_on_db_error
 async def mark_delivered(message_id: int, role: str):
     """WhatsApp-style "delivered" (design decision, 2026-09-26): the message reached the
     session, because its mail watch picked it up. mailwatch.sh calls this
@@ -674,20 +587,23 @@ async def mark_delivered(message_id: int, role: str):
 
 
 @app.post("/messages/{message_id}/delivered-batch")
+@retry_on_db_error
 async def mark_delivered_batch(message_id: int, req: DeliveredBatchRequest):
     """Mark several recipients of one message delivered in a single call
     (coordinator-claude's fan-out nudges). Same meaning as /delivered: the
     message reached that session; the first delivery time is kept."""
     async with pool.acquire() as conn:
-        await conn.execute(
-            """UPDATE deliveries SET delivered_at = $1
-               WHERE message_id = $2 AND recipient_role = ANY($3::text[]) AND delivered_at IS NULL""",
-            _now(), message_id, req.roles,
-        )
+        if req.roles:
+            await conn.execute(
+                f"""UPDATE deliveries SET delivered_at = $1
+                   WHERE message_id = $2 AND recipient_role IN ({ph(3, len(req.roles))}) AND delivered_at IS NULL""",
+                _now(), message_id, *req.roles,
+            )
     return {"ok": True, "marked": req.roles}
 
 
 @app.post("/messages/{message_id}/read")
+@retry_on_db_error
 async def mark_read(message_id: int, role: str):
     """The 'calling off' step: a session works through its GET /pending
     list in order and calls this once per message as it processes each
@@ -701,13 +617,12 @@ async def mark_read(message_id: int, role: str):
     /pending look like a dropped delivery."""
     async with pool.acquire() as conn:
         async with conn.transaction():
-            updated = await conn.fetchval(
+            updated = await conn.execute(
                 """UPDATE deliveries SET read_at = $1
-                   WHERE message_id = $2 AND recipient_role = $3 AND read_at IS NULL
-                   RETURNING 1""",
+                   WHERE message_id = $2 AND recipient_role = $3 AND read_at IS NULL""",
                 _now(), message_id, role,
             )
-            if updated is None:
+            if updated == 0:
                 row = await conn.fetchrow(
                     "SELECT read_at FROM deliveries WHERE message_id = $1 AND recipient_role = $2",
                     message_id, role,
@@ -724,6 +639,7 @@ async def mark_read(message_id: int, role: str):
 
 
 @app.post("/messages/{message_id}/ack")
+@retry_on_db_error
 async def ack_message(message_id: int, role: str):
     """The 'thumbs up': an info-only message needs no reply, just a
     signal that this recipient saw it and is deliberately taking no
@@ -737,13 +653,12 @@ async def ack_message(message_id: int, role: str):
     for what's semantically the same "you actioned this once" signal."""
     async with pool.acquire() as conn:
         async with conn.transaction():
-            updated = await conn.fetchval(
+            updated = await conn.execute(
                 """UPDATE deliveries SET ack_at = $1, read_at = COALESCE(read_at, $1)
-                   WHERE message_id = $2 AND recipient_role = $3 AND ack_at IS NULL
-                   RETURNING 1""",
+                   WHERE message_id = $2 AND recipient_role = $3 AND ack_at IS NULL""",
                 _now(), message_id, role,
             )
-            if updated is None:
+            if updated == 0:
                 row = await conn.fetchrow(
                     "SELECT ack_at FROM deliveries WHERE message_id = $1 AND recipient_role = $2",
                     message_id, role,
@@ -760,6 +675,7 @@ async def ack_message(message_id: int, role: str):
 
 
 @app.get("/roles/{role}/pending")
+@retry_on_db_error
 async def pending_for_role(role: str, after: int = 0, peek: bool = False):
     """Read-only listing -- does NOT mark anything read. Its one side
     effect is recording the role as last seen (checked mail), because a
@@ -809,26 +725,28 @@ async def get_thread_history(thread_id: int):
         if not exists:
             raise HTTPException(404, f"thread {thread_id} does not exist")
         rows = await conn.fetch(
-            """SELECT m.message_id, m.sender_role, m.body, m.created_at,
-                      COALESCE(
-                          array_agg(d.recipient_role) FILTER (WHERE d.ack_at IS NOT NULL),
-                          ARRAY[]::text[]
-                      ) AS acked_by
-               FROM messages m
-               LEFT JOIN deliveries d ON d.message_id = m.message_id
-               WHERE m.thread_id = $1
-               GROUP BY m.message_id
-               ORDER BY m.message_id""",
+            """SELECT message_id, sender_role, body, created_at
+               FROM messages WHERE thread_id = $1 ORDER BY message_id""",
             thread_id,
         )
-    return {"messages": [dict(r) for r in rows]}
+        acks = await conn.fetch(
+            """SELECT d.message_id, d.recipient_role
+               FROM deliveries d JOIN messages m ON m.message_id = d.message_id
+               WHERE m.thread_id = $1 AND d.ack_at IS NOT NULL
+               ORDER BY d.message_id, d.recipient_role""",
+            thread_id,
+        )
+    acked_by: dict[int, list] = {}
+    for a in acks:
+        acked_by.setdefault(a["message_id"], []).append(a["recipient_role"])
+    return {"messages": [{**r, "acked_by": acked_by.get(r["message_id"], [])} for r in rows]}
 
 
 def _esc(v) -> str:
     return html.escape(str(v)) if v is not None else ""
 
 
-async def _fetch_recent_threads(conn: asyncpg.Connection):
+async def _fetch_recent_threads(conn: agora_db.Conn):
     """Last 10 threads by most recent activity, plus their messages.
     Shared by the full dashboard render and the polling fragment endpoint
     so the two never drift out of sync."""
@@ -838,26 +756,26 @@ async def _fetch_recent_threads(conn: asyncpg.Connection):
                   MAX(m.created_at) AS last_message_at
            FROM threads t
            LEFT JOIN messages m ON m.thread_id = t.thread_id
-           GROUP BY t.thread_id
+           GROUP BY t.thread_id, t.group_id, t.topic, t.status, t.created_at
            ORDER BY COALESCE(MAX(m.created_at), t.created_at) DESC
            LIMIT 10"""
     )
     recent_thread_ids = [t["thread_id"] for t in recent_thread_rows]
     recent_messages_rows = await conn.fetch(
-        """SELECT thread_id, message_id, sender_role, body, created_at
-           FROM messages WHERE thread_id = ANY($1::int[])
+        f"""SELECT thread_id, message_id, sender_role, body, created_at
+           FROM messages WHERE thread_id IN ({ph(1, len(recent_thread_ids))})
            ORDER BY thread_id, message_id""",
-        recent_thread_ids,
+        *recent_thread_ids,
     ) if recent_thread_ids else []
 
     recent_message_ids = [m["message_id"] for m in recent_messages_rows]
     delivery_rows = await conn.fetch(
-        """SELECT d.message_id, d.recipient_role, d.delivered_at, d.read_at, d.ack_at
+        f"""SELECT d.message_id, d.recipient_role, d.delivered_at, d.read_at, d.ack_at
            FROM deliveries d
            JOIN messages m ON m.message_id = d.message_id
-           WHERE d.message_id = ANY($1::int[]) AND d.recipient_role != m.sender_role
+           WHERE d.message_id IN ({ph(1, len(recent_message_ids))}) AND d.recipient_role != m.sender_role
            ORDER BY d.message_id, d.recipient_role""",
-        recent_message_ids,
+        *recent_message_ids,
     ) if recent_message_ids else []
 
     recent_messages_by_thread: dict[int, list] = {}
@@ -994,18 +912,19 @@ async def dashboard_state(since_id: int = 0, since_ts: Optional[datetime] = None
     since_cutoff = since_ts - timedelta(seconds=10) if since_ts else None
     async with pool.acquire() as conn, conn.transaction(isolation="repeatable_read", readonly=True):
         # One snapshot for every query below, so the parts agree.
-        server_time = await conn.fetchval("SELECT clock_timestamp()")
+        server_time = await conn.fetchval("SELECT UTC_TIMESTAMP(6)")
         roles = await conn.fetch(
             """SELECT b.role, b.session_name, b.status, b.bound_at, r.last_seen_at, r.last_seen_action,
                       r.last_action_at, r.heartbeat_at, r.heartbeat_interval
                FROM role_bindings b JOIN roles r ON r.role = b.role ORDER BY b.role"""
         )
-        groups = await conn.fetch(
-            """SELECT g.group_id,
-                      COALESCE(array_agg(gm.role ORDER BY gm.role) FILTER (WHERE gm.left_at IS NULL), ARRAY[]::text[]) AS members
-               FROM groups g LEFT JOIN group_members gm ON gm.group_id = g.group_id
-               GROUP BY g.group_id"""
+        group_ids = await conn.fetch("SELECT group_id FROM `groups`")
+        member_rows = await conn.fetch(
+            "SELECT group_id, role FROM group_members WHERE left_at IS NULL ORDER BY group_id, role"
         )
+        members_by_group: dict[int, list] = {g["group_id"]: [] for g in group_ids}
+        for r in member_rows:
+            members_by_group.setdefault(r["group_id"], []).append(r["role"])
         threads = await conn.fetch(
             "SELECT thread_id, group_id, topic, status, created_at FROM threads ORDER BY thread_id"
         )
@@ -1036,11 +955,11 @@ async def dashboard_state(since_id: int = 0, since_ts: Optional[datetime] = None
             """SELECT m.message_id, m.attn_kind, m.attn_why, m.attn_answered_by, m.attn_cleared_at
                FROM messages m LEFT JOIN messages a ON a.message_id = m.attn_answered_by
                WHERE m.attn_kind IS NOT NULL
-                 AND ($1::timestamptz IS NULL
+                 AND ($1 IS NULL
                       OR m.message_id > $2
                       OR (m.attn_answered_by IS NULL AND m.attn_cleared_at IS NULL)
-                      OR m.attn_cleared_at > $1::timestamptz
-                      OR a.created_at > $1::timestamptz)
+                      OR m.attn_cleared_at > $1
+                      OR a.created_at > $1)
                ORDER BY m.message_id""",
             since_cutoff, since_id,
         )
@@ -1050,16 +969,16 @@ async def dashboard_state(since_id: int = 0, since_ts: Optional[datetime] = None
             # of the messages cap.
             loaded_ids = [m["message_id"] for m in messages]
             deliveries = await conn.fetch(
-                """SELECT d.message_id, d.recipient_role,
+                f"""SELECT d.message_id, d.recipient_role,
                           CASE WHEN d.ack_at IS NOT NULL THEN 'a'
                                WHEN d.read_at IS NOT NULL THEN 'r'
                                WHEN d.delivered_at IS NOT NULL THEN 'n'
                                ELSE 'p' END AS stage
                    FROM deliveries d JOIN messages m ON m.message_id = d.message_id
-                   WHERE d.recipient_role <> m.sender_role AND d.message_id = ANY($1::int[])
+                   WHERE d.recipient_role <> m.sender_role AND d.message_id IN ({ph(1, len(loaded_ids))})
                    ORDER BY d.message_id""",
-                loaded_ids,
-            )
+                *loaded_ids,
+            ) if loaded_ids else []
         else:
             deliveries = await conn.fetch(
                 """SELECT d.message_id, d.recipient_role,
@@ -1070,8 +989,7 @@ async def dashboard_state(since_id: int = 0, since_ts: Optional[datetime] = None
                    FROM deliveries d JOIN messages m ON m.message_id = d.message_id
                    WHERE d.recipient_role <> m.sender_role
                      AND (d.message_id > $1
-                          OR ($2::timestamptz IS NOT NULL
-                              AND GREATEST(d.delivered_at, d.read_at, d.ack_at) > $2::timestamptz))
+                          OR d.delivered_at > $2 OR d.read_at > $2 OR d.ack_at > $2)
                    ORDER BY d.message_id""",
                 since_id,
                 since_cutoff,
@@ -1079,7 +997,7 @@ async def dashboard_state(since_id: int = 0, since_ts: Optional[datetime] = None
     return {
         "server_time": server_time,
         "roles": [dict(r) for r in roles],
-        "groups": {g["group_id"]: list(g["members"]) for g in groups},
+        "groups": members_by_group,
         "threads": [dict(t) for t in threads],
         "message_counts": {c["thread_id"]: c["n"] for c in message_counts},
         "messages": [dict(m) for m in messages],
@@ -1100,21 +1018,20 @@ async def dashboard_classic():
         bindings = await conn.fetch(
             "SELECT role, session_name, status, bound_at FROM role_bindings ORDER BY role"
         )
-        group_rows = await conn.fetch(
-            """SELECT g.group_id, g.created_at,
-                      COALESCE(array_agg(gm.role ORDER BY gm.role) FILTER (WHERE gm.left_at IS NULL), ARRAY[]::text[]) AS members
-               FROM groups g
-               LEFT JOIN group_members gm ON gm.group_id = g.group_id
-               GROUP BY g.group_id
-               ORDER BY g.group_id"""
+        group_rows = await conn.fetch("SELECT group_id, created_at FROM `groups` ORDER BY group_id")
+        classic_members = await conn.fetch(
+            "SELECT group_id, role FROM group_members WHERE left_at IS NULL ORDER BY group_id, role"
         )
+        members_of: dict[int, list] = {}
+        for r in classic_members:
+            members_of.setdefault(r["group_id"], []).append(r["role"])
         thread_rows = await conn.fetch(
             """SELECT t.thread_id, t.group_id, t.topic, t.status, t.created_at,
                       COUNT(m.message_id) AS message_count,
                       MAX(m.created_at) AS last_message_at
                FROM threads t
                LEFT JOIN messages m ON m.thread_id = t.thread_id
-               GROUP BY t.thread_id
+               GROUP BY t.thread_id, t.group_id, t.topic, t.status, t.created_at
                ORDER BY t.group_id, t.thread_id"""
         )
         recent_thread_rows, recent_messages_by_thread, deliveries_by_message = await _fetch_recent_threads(conn)
@@ -1135,7 +1052,7 @@ async def dashboard_classic():
 
     group_sections_html = ""
     for g in group_rows:
-        members_html = ", ".join(_esc(m) for m in g["members"]) or "<em>no members</em>"
+        members_html = ", ".join(_esc(m) for m in members_of.get(g["group_id"], [])) or "<em>no members</em>"
         thread_rows_html = "".join(
             f"""<tr class="{_esc(t['status'])}">
                     <td>{t['thread_id']}</td>

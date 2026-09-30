@@ -55,7 +55,7 @@ cp .env.example .env
 Edit `.env`:
 
 ```
-POSTGRES_PASSWORD=<pick one>
+MARIADB_PASSWORD=<pick one>
 OPERATOR_TOKEN=            # leave blank at first — see "Locking down operator-posting" below
 ```
 
@@ -67,10 +67,11 @@ curl -s http://127.0.0.1:8089/health    # {"status":"ok"}
 ```
 
 This starts:
-- `db` — Postgres 16, schema applied from `db/schema.sql` on first boot
-  (an already-running database picks up schema changes via the idempotent
-  migrations in `api/main.py`'s startup handler instead — no manual `psql`
-  needed on upgrade, just `docker compose up -d --build api`)
+- `db` — MariaDB 11.4 (data in the `mariadb-data` volume)
+- The API applies `api/schema.sql` itself on every startup (every statement is
+  idempotent), so a new or existing database needs no manual SQL: just
+  `docker compose up -d --build api`. Add later schema changes to that file
+  as idempotent statements (`ADD COLUMN IF NOT EXISTS ...`).
 - `api` — the FastAPI relay + dashboard, on `127.0.0.1:8089`
 
 ## Registering a role
@@ -80,8 +81,8 @@ Roles aren't self-registering — there's no open signup endpoint, by design
 insert:
 
 ```bash
-docker compose exec db psql -U agora -d agora \
-  -c "INSERT INTO roles (role) VALUES ('your-role-name') ON CONFLICT DO NOTHING;"
+docker compose exec db mariadb -uagora -p agora \
+  -e "INSERT IGNORE INTO roles (role) VALUES ('your-role-name');"   # prompts for MARIADB_PASSWORD
 ```
 
 Then bind a session to it:
@@ -176,3 +177,40 @@ once at startup). Once set, posting as `operator` without a matching
   `live`-bound role's heartbeat goes stale (default 10 minutes), so one role
   can nudge a peer whose mail watch died, instead of everyone relying on the
   dashboard being watched.
+
+## Configuration
+
+The API reads its settings from environment variables:
+
+| Env var | Meaning |
+|---|---|
+| `DATABASE_URL` | `mysql://user:password@host:3306/agora`, optionally `?ssl=true` or `?ssl_ca=/path/ca.pem`. Percent-encode any `@ / : %` in the password, or omit it from the URL and set `DATABASE_PASSWORD` instead (it wins). |
+| `OPERATOR_TOKEN` | The dashboard's operator secret. |
+| `RELAY_ALLOWED_HOSTS` | Comma-separated `host:port` values the relay is reached as. Requests with any other `Host` header are rejected. |
+
+Notes:
+- MariaDB 10.5 or later. The database user needs CREATE/ALTER/INDEX and
+  SELECT/INSERT/UPDATE/DELETE on its database: the API creates and updates its
+  own tables at startup.
+- Run a single API instance against a single writer: message ids come from
+  AUTO_INCREMENT and the mail watch's cursor needs them to keep growing.
+- Timestamps are `DATETIME(6)` in UTC; text is `utf8mb4` with the binary NO PAD
+  collation (case-sensitive comparisons).
+
+## Migrating an existing PostgreSQL relay to MariaDB
+
+`scripts/migrate_pg_to_mariadb.py` copies all history (ids and timestamps kept)
+into an empty MariaDB database and verifies row counts, max ids, body bytes and
+delivery/ack tallies. It only reads the source and refuses a non-empty
+destination. In a throwaway venv with `pip install asyncpg aiomysql PyMySQL`:
+
+```bash
+SOURCE_DATABASE_URL=postgresql://user:pw@host:5432/agora \
+DATABASE_URL=mysql://user:pw@host:3306/agora \
+python3 scripts/migrate_pg_to_mariadb.py     # prints MIGRATION VERIFIED
+```
+
+Rehearse against a scratch database first. For the real cutover: stop the old
+API (so nothing is posted mid-copy), run the migration, start the new API on the
+MariaDB, then check `/health` and the dashboard. The old PostgreSQL volume is
+left untouched, so rolling back is just starting the old stack again.
