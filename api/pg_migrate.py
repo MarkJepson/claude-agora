@@ -49,6 +49,10 @@ ID_COLUMN = {"groups": "group_id", "threads": "thread_id", "messages": "message_
 FORMAT = 1
 
 
+class _VerificationFailed(Exception):
+    pass
+
+
 def q(table: str) -> str:
     return f"`{table}`" if table == "groups" else table
 
@@ -70,29 +74,36 @@ async def export(path: str) -> int:
         return 2
     src = await asyncpg.connect(url)
     try:
-        dump = {"format": FORMAT, "tables": {}, "links": [], "checks": {}}
-        for table, cols in TABLES:
-            rows = await src.fetch(f"SELECT {', '.join(cols)} FROM {table} ORDER BY {ORDER.get(table, cols[0])}")
-            dump["tables"][table] = [[_enc(r[c]) for c in cols] for r in rows]
-            print(f"exported {table}: {len(rows)} rows")
-        links = await src.fetch("SELECT message_id, attn_answered_by FROM messages WHERE attn_answered_by IS NOT NULL")
-        dump["links"] = [[r["message_id"], r["attn_answered_by"]] for r in links]
-        checks = {"counts": {t: len(dump["tables"][t]) for t, _ in TABLES}, "max_ids": {}}
-        for table, col in ID_COLUMN.items():
-            checks["max_ids"][table] = await src.fetchval(f"SELECT COALESCE(MAX({col}), 0) FROM {table}")
-        checks["body_bytes"] = int(await src.fetchval("SELECT COALESCE(SUM(octet_length(body)), 0) FROM messages"))
-        checks["delivery_tallies"] = [
-            await src.fetchval(f"SELECT COUNT(*) FROM deliveries WHERE {c} IS NOT NULL")
-            for c in ("delivered_at", "read_at", "ack_at")
-        ]
-        checks["answered_asks"] = len(dump["links"])
-        dump["checks"] = checks
-        Path(path).write_text(json.dumps(dump, ensure_ascii=False))
-        os.chmod(path, 0o600)
-        print(f"wrote {path} (mode 600). It holds all message text: delete it when the import is done.")
-        return 0
+        # One repeatable-read snapshot for every query, so the tables and the
+        # recorded checks agree even if the old API is still being written to.
+        async with src.transaction(isolation="repeatable_read", readonly=True):
+            return await _export_snapshot(src, path)
     finally:
         await src.close()
+
+
+async def _export_snapshot(src, path: str) -> int:
+    dump = {"format": FORMAT, "tables": {}, "links": [], "checks": {}}
+    for table, cols in TABLES:
+        rows = await src.fetch(f"SELECT {', '.join(cols)} FROM {table} ORDER BY {ORDER.get(table, cols[0])}")
+        dump["tables"][table] = [[_enc(r[c]) for c in cols] for r in rows]
+        print(f"exported {table}: {len(rows)} rows")
+    links = await src.fetch("SELECT message_id, attn_answered_by FROM messages WHERE attn_answered_by IS NOT NULL")
+    dump["links"] = [[r["message_id"], r["attn_answered_by"]] for r in links]
+    checks = {"counts": {t: len(dump["tables"][t]) for t, _ in TABLES}, "max_ids": {}}
+    for table, col in ID_COLUMN.items():
+        checks["max_ids"][table] = await src.fetchval(f"SELECT COALESCE(MAX({col}), 0) FROM {table}")
+    checks["body_bytes"] = int(await src.fetchval("SELECT COALESCE(SUM(octet_length(body)), 0) FROM messages"))
+    checks["delivery_tallies"] = [
+        await src.fetchval(f"SELECT COUNT(*) FROM deliveries WHERE {c} IS NOT NULL")
+        for c in ("delivered_at", "read_at", "ack_at")
+    ]
+    checks["answered_asks"] = len(dump["links"])
+    dump["checks"] = checks
+    Path(path).write_text(json.dumps(dump, ensure_ascii=False))
+    os.chmod(path, 0o600)
+    print(f"wrote {path} (mode 600). It holds all message text: delete it when the import is done.")
+    return 0
 
 
 async def import_(path: str) -> int:
@@ -112,47 +123,55 @@ async def import_(path: str) -> int:
                 if await dst.fetchval(f"SELECT COUNT(*) FROM {q(t)}"):
                     print(f"refusing: destination already has rows in {t}; import into an empty database", file=sys.stderr)
                     return 1
-            async with dst.transaction():
-                for table, cols in TABLES:
-                    ph = agora_db.ph(1, len(cols))
-                    if table == "roles":
-                        # 'operator' is seeded by schema.sql; take the source's values for it too.
-                        sql = (f"INSERT INTO roles ({', '.join(cols)}) VALUES ({ph}) ON DUPLICATE KEY UPDATE "
-                               + ", ".join(f"{c} = VALUES({c})" for c in cols[1:]))
-                    else:
-                        sql = f"INSERT INTO {q(table)} ({', '.join(cols)}) VALUES ({ph})"
-                    for row in dump["tables"][table]:
-                        await dst.execute(sql, *[_dec(v) for v in row])
-                    print(f"imported {table}: {len(dump['tables'][table])} rows")
-                for message_id, answered_by in dump["links"]:
-                    await dst.execute("UPDATE messages SET attn_answered_by = $1 WHERE message_id = $2",
-                                      answered_by, message_id)
-                print(f"linked attn_answered_by: {len(dump['links'])}")
+            failures: list[str] = []
+            try:
+                async with dst.transaction():
+                    for table, cols in TABLES:
+                        ph = agora_db.ph(1, len(cols))
+                        if table == "roles":
+                            # 'operator' is seeded by schema.sql; take the source's values for it too.
+                            sql = (f"INSERT INTO roles ({', '.join(cols)}) VALUES ({ph}) ON DUPLICATE KEY UPDATE "
+                                   + ", ".join(f"{c} = VALUES({c})" for c in cols[1:]))
+                        else:
+                            sql = f"INSERT INTO {q(table)} ({', '.join(cols)}) VALUES ({ph})"
+                        for row in dump["tables"][table]:
+                            await dst.execute(sql, *[_dec(v) for v in row])
+                        print(f"imported {table}: {len(dump['tables'][table])} rows")
+                    for message_id, answered_by in dump["links"]:
+                        await dst.execute("UPDATE messages SET attn_answered_by = $1 WHERE message_id = $2",
+                                          answered_by, message_id)
+                    print(f"linked attn_answered_by: {len(dump['links'])}")
 
-            # ---- verify against what the source looked like at export time ----
-            chk, ok = dump["checks"], True
+                    # ---- verify against the source as it was at export time, BEFORE
+                    # committing: any mismatch rolls the whole import back ----
+                    chk = dump["checks"]
 
-            def report(good: bool, line: str):
-                nonlocal ok
-                ok &= good
-                print(("OK   " if good else "FAIL ") + line)
+                    def report(good: bool, line: str):
+                        print(("OK   " if good else "FAIL ") + line)
+                        if not good:
+                            failures.append(line)
 
-            for table, _ in TABLES:
-                n = await dst.fetchval(f"SELECT COUNT(*) FROM {q(table)}")
-                report(n == chk["counts"][table], f"{table}: dump {chk['counts'][table]}, database {n}")
-            for table, col in ID_COLUMN.items():
-                m = await dst.fetchval(f"SELECT COALESCE(MAX({col}), 0) FROM {q(table)}")
-                report(m == chk["max_ids"][table], f"max {col}: dump {chk['max_ids'][table]}, database {m}")
-            body = int(await dst.fetchval("SELECT COALESCE(SUM(OCTET_LENGTH(body)), 0) FROM messages"))
-            report(body == chk["body_bytes"], f"message body bytes: dump {chk['body_bytes']}, database {body}")
-            tallies = [await dst.fetchval(f"SELECT COUNT(*) FROM deliveries WHERE {c} IS NOT NULL")
-                       for c in ("delivered_at", "read_at", "ack_at")]
-            report(tallies == chk["delivery_tallies"],
-                   f"deliveries delivered/read/ack: dump {chk['delivery_tallies']}, database {tallies}")
-            answered = await dst.fetchval("SELECT COUNT(*) FROM messages WHERE attn_answered_by IS NOT NULL")
-            report(answered == chk["answered_asks"], f"answered asks: dump {chk['answered_asks']}, database {answered}")
-            print("IMPORT VERIFIED" if ok else "IMPORT FAILED VERIFICATION")
-            return 0 if ok else 1
+                    for table, _ in TABLES:
+                        n = await dst.fetchval(f"SELECT COUNT(*) FROM {q(table)}")
+                        report(n == chk["counts"][table], f"{table}: dump {chk['counts'][table]}, database {n}")
+                    for table, col in ID_COLUMN.items():
+                        mx = await dst.fetchval(f"SELECT COALESCE(MAX({col}), 0) FROM {q(table)}")
+                        report(mx == chk["max_ids"][table], f"max {col}: dump {chk['max_ids'][table]}, database {mx}")
+                    body = int(await dst.fetchval("SELECT COALESCE(SUM(OCTET_LENGTH(body)), 0) FROM messages"))
+                    report(body == chk["body_bytes"], f"message body bytes: dump {chk['body_bytes']}, database {body}")
+                    tallies = [await dst.fetchval(f"SELECT COUNT(*) FROM deliveries WHERE {c} IS NOT NULL")
+                               for c in ("delivered_at", "read_at", "ack_at")]
+                    report(tallies == chk["delivery_tallies"],
+                           f"deliveries delivered/read/ack: dump {chk['delivery_tallies']}, database {tallies}")
+                    answered = await dst.fetchval("SELECT COUNT(*) FROM messages WHERE attn_answered_by IS NOT NULL")
+                    report(answered == chk["answered_asks"], f"answered asks: dump {chk['answered_asks']}, database {answered}")
+                    if failures:
+                        raise _VerificationFailed()
+            except _VerificationFailed:
+                print("IMPORT FAILED VERIFICATION: rolled back, nothing was imported", file=sys.stderr)
+                return 1
+            print("IMPORT VERIFIED")
+            return 0
     finally:
         await pool.close()
 

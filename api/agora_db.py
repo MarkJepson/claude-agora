@@ -140,14 +140,19 @@ class Conn:
 
 class Pool:
     """aiomysql pool that rebuilds itself when its TLS files change on disk, so
-    a rotated client certificate / CA bundle is picked up without a restart."""
+    a rotated client certificate / CA bundle is picked up without a restart.
+
+    The rebuild runs in a background task, never in a request: requests keep
+    using the current pool until the new one is open, then new acquires go to the
+    new pool and the old one drains and closes."""
 
     def __init__(self, make_kwargs, watched: list[str]):
         self._make_kwargs = make_kwargs
         self._watched = watched
         self._p: Optional[aiomysql.Pool] = None
         self._stamp: tuple = ()
-        self._lock = asyncio.Lock()
+        self._reload_task: Optional[asyncio.Task] = None
+        self._draining: set = set()
         self._next_reload_try = 0.0
 
     def _stat(self) -> tuple:
@@ -162,36 +167,58 @@ class Pool:
     async def _open(self) -> aiomysql.Pool:
         return await aiomysql.create_pool(**self._make_kwargs())
 
-    async def _maybe_reload(self) -> None:
-        if not self._watched or self._stat() == self._stamp:
+    def _maybe_reload(self) -> None:
+        if not self._watched or (self._reload_task and not self._reload_task.done()):
             return
-        async with self._lock:
-            stamp = self._stat()
-            if stamp == self._stamp or time.monotonic() < self._next_reload_try:
-                return
-            try:
-                new = await self._open()
-            except Exception as e:  # files may be mid-rotation: keep serving, retry shortly
-                self._next_reload_try = time.monotonic() + 10
-                log.error("TLS files changed but the new pool failed to open (%s); keeping the current one", e)
-                return
-            old, self._p, self._stamp = self._p, new, stamp
-            log.info("TLS files changed; database pool rebuilt with the new certificates")
-            old.close()
-            asyncio.create_task(old.wait_closed())
+        if self._stat() == self._stamp or time.monotonic() < self._next_reload_try:
+            return
+        self._reload_task = asyncio.create_task(self._reload())
+
+    async def _reload(self) -> None:
+        stamp = self._stat()
+        try:
+            new = await self._open()
+        except Exception as e:  # files may be mid-rotation: keep serving, retry shortly
+            self._next_reload_try = time.monotonic() + 10
+            log.error("TLS files changed but the new pool failed to open (%s); keeping the current one", e)
+            return
+        old, self._p, self._stamp = self._p, new, stamp
+        log.info("TLS files changed; database pool rebuilt with the new certificates")
+        old.close()  # idle connections close now, busy ones as they are released
+        t = asyncio.create_task(old.wait_closed())
+        self._draining.add(t)
+        t.add_done_callback(self._draining.discard)
 
     @asynccontextmanager
     async def acquire(self):
-        await self._maybe_reload()
-        async with self._p.acquire() as raw:
+        self._maybe_reload()
+        # If the pool is swapped while this call is queued on the old one, the
+        # old pool raises "closing"; go again on the new pool.
+        for attempt in (1, 2):
+            pool = self._p
+            cm = pool.acquire()
+            try:
+                raw = await cm.__aenter__()
+                break
+            except RuntimeError:
+                if attempt == 2 or pool is self._p:
+                    raise
+        try:
             # A pooled connection can have been dropped by a server restart or
             # a proxy idle timeout; reconnect instead of failing.
             await raw.ping(reconnect=True)
             yield Conn(raw)
+        finally:
+            await cm.__aexit__(None, None, None)
 
     async def close(self) -> None:
-        self._p.close()
-        await self._p.wait_closed()
+        if self._reload_task and not self._reload_task.done():
+            self._reload_task.cancel()
+        if self._p is not None:
+            self._p.close()
+            await self._p.wait_closed()
+        for t in list(self._draining):
+            await t
 
 
 def _ssl_context(q: dict):
@@ -230,6 +257,7 @@ async def create_pool(url: str, min_size: int = 1, max_size: int = 4, wait_secon
             client_flag=CLIENT.FOUND_ROWS,
             init_command="SET time_zone = '+00:00'",
             pool_recycle=280,
+            connect_timeout=10,
             ssl=_ssl_context(q),  # re-read from disk on every (re)build
         )
 
@@ -240,6 +268,8 @@ async def create_pool(url: str, min_size: int = 1, max_size: int = 4, wait_secon
             pool._stamp = pool._stat()
             pool._p = await pool._open()
             return pool
+        except (FileNotFoundError, PermissionError, ssl.SSLError):
+            raise  # a missing/unreadable/invalid certificate file won't fix itself
         except (pymysql.err.OperationalError, OSError) as e:
             if attempt * 2 >= wait_seconds:
                 raise
@@ -250,7 +280,23 @@ async def create_pool(url: str, min_size: int = 1, max_size: int = 4, wait_secon
 
 _CREATE_TABLE = re.compile(r"CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+`?(\w+)`?", re.I)
 _CREATE_INDEX = re.compile(r"CREATE\s+INDEX\s+IF\s+NOT\s+EXISTS\s+`?(\w+)`?\s+ON\s+`?(\w+)`?", re.I)
-_ADD_COLUMN = re.compile(r"ALTER\s+TABLE\s+`?(\w+)`?\s+ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+`?(\w+)`?", re.I)
+_ALTER_TABLE = re.compile(r"ALTER\s+TABLE\s+`?(\w+)`?", re.I)
+_ADD_COLUMN_CLAUSE = re.compile(r"\s*ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+`?(\w+)`?", re.I)
+
+
+def _split_clauses(text: str) -> list[str]:
+    """Splits an ALTER TABLE's clauses on top-level commas (a comma inside
+    parentheses, like DECIMAL(10,2), belongs to the column definition)."""
+    out, depth, cur = [], 0, []
+    for ch in text:
+        depth += ch == "("
+        depth -= ch == ")"
+        if ch == "," and depth == 0:
+            out.append("".join(cur)); cur = []
+        else:
+            cur.append(ch)
+    out.append("".join(cur))
+    return [c for c in out if c.strip()]
 
 
 async def _already_applied(conn: "Conn", stmt: str) -> bool:
@@ -266,11 +312,18 @@ async def _already_applied(conn: "Conn", stmt: str) -> bool:
         return bool(await conn.fetchval(
             "SELECT 1 FROM information_schema.statistics WHERE table_schema = DATABASE() "
             "AND table_name = $1 AND index_name = $2 LIMIT 1", m.group(2), m.group(1)))
-    m = _ADD_COLUMN.match(stmt)
+    m = _ALTER_TABLE.match(stmt)
     if m:
-        return bool(await conn.fetchval(
-            "SELECT 1 FROM information_schema.columns WHERE table_schema = DATABASE() "
-            "AND table_name = $1 AND column_name = $2", m.group(1), m.group(2)))
+        clauses = _split_clauses(stmt[m.end():])
+        cols = [_ADD_COLUMN_CLAUSE.match(c) for c in clauses]
+        if clauses and all(cols):
+            # Every clause is "ADD COLUMN IF NOT EXISTS ...": skip only if all exist.
+            for c in cols:
+                if not await conn.fetchval(
+                        "SELECT 1 FROM information_schema.columns WHERE table_schema = DATABASE() "
+                        "AND table_name = $1 AND column_name = $2", m.group(1), c.group(1)):
+                    return False
+            return True
     return False
 
 
@@ -283,7 +336,7 @@ async def apply_schema(conn: Conn, path: Path) -> int:
     for stmt in (s.strip() for s in text.split(";")):
         if not stmt or await _already_applied(conn, stmt):
             continue
-        is_ddl = not stmt.upper().startswith("INSERT")
+        is_ddl = stmt.split(None, 1)[0].upper() in ("CREATE", "ALTER", "DROP", "RENAME", "TRUNCATE")
         for attempt in range(1, 6):
             try:
                 await conn.execute(stmt)
