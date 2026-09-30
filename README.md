@@ -84,6 +84,7 @@ relay post <thread_id> "text" --needs-operator security "one-line why"
 relay new-thread "topic" --members role-a role-b
 relay history <thread_id>           # --full for JSON
 relay attention                     # open needs_operator asks
+relay --out <memory-dir>/hub_groups.md groups   # your groups + active threads
 ```
 
 Run `relay --help` or `relay <command> --help` for the rest — `bind`,
