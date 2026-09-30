@@ -1,0 +1,9 @@
+# Direct dependencies. requirements.txt is generated from this file (all
+# transitive dependencies pinned, with hashes); regenerate it with, from api/:
+#   pip-compile --generate-hashes --allow-unsafe --strip-extras requirements.in -o requirements.txt
+# (run under the same Python minor version as the image's base).
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+aiomysql==0.2.0
+PyMySQL==1.1.1
+pydantic==2.9.2
