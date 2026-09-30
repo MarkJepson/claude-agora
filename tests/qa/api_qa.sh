@@ -16,7 +16,7 @@ ME=coordinator-claude
 # The relay enforces OPERATOR_TOKEN for sender_role=operator posts and attention
 # clears (403 without it). Use the same secret the relay was started with:
 # from the environment, else the gitignored .env. Never printed.
-OPERATOR_TOKEN=${OPERATOR_TOKEN:-$(sed -n 's/^OPERATOR_TOKEN=//p' "$REPO_ROOT/.env" 2>/dev/null | head -1 | tr -d "\"'")}
+OPERATOR_TOKEN=${OPERATOR_TOKEN:-$(sed -n 's/^OPERATOR_TOKEN=//p' "$REPO_ROOT/.env" 2>/dev/null | head -1 | tr -d "\"'\r ")}
 OPH=(); [ -n "$OPERATOR_TOKEN" ] && OPH=(-H "X-Operator-Token: $OPERATOR_TOKEN")
 [ -n "$OPERATOR_TOKEN" ] || echo "WARNING: no OPERATOR_TOKEN (env or .env): operator-post cases will 403 if the relay enforces it." >&2
 PASS=0; FAIL=0
@@ -108,7 +108,10 @@ R=$(post /threads/$T/messages '{"sender_role":"operator","body":"QA plain messag
 M1=$(echo "$R" | jq -r .message_id)
 eq "operator's post reaches the member" "$(echo "$R" | jq -c .recipients)" "[\"$ME\"]"
 eq "post returns group_id"     "$(echo "$R" | jq -r .group_id)" "$G"
-[ -n "$OPERATOR_TOKEN" ] && eq "operator post without token 403" "$(curl -s -o /dev/null -w '%{http_code}' -X POST $A/threads/$T/messages -H 'Content-Type: application/json' -H 'X-Relay-Client: qa' -d '{"sender_role":"operator","body":"x"}')" 403
+NOTOK=$(curl -s -o /dev/null -w '%{http_code}' -X POST $A/threads/$T/messages -H 'Content-Type: application/json' -H 'X-Relay-Client: qa' -d '{"sender_role":"operator","body":"QA tokenless operator post (must be refused)."}')
+if [ "$NOTOK" = 403 ]; then ok "operator post without token 403"
+elif [ -z "$OPERATOR_TOKEN" ]; then echo "SKIP  operator post without token 403 (no token available; relay enforcement unknown)"
+else bad "operator post without token 403" "got $NOTOK -- is the relay running without OPERATOR_TOKEN?"; fi
 eq "operator never gets a delivery row" "$(db "SELECT count(*) FROM deliveries WHERE recipient_role='operator'")" 0
 eq "bad kind 422"              "$(code -X POST $A/threads/$T/messages -H 'Content-Type: application/json' -d '{"sender_role":"coordinator-claude","body":"x","needs_operator":{"kind":"urgent","why":"x"}}')" 422
 eq "empty why 422"             "$(code -X POST $A/threads/$T/messages -H 'Content-Type: application/json' -d '{"sender_role":"coordinator-claude","body":"x","needs_operator":{"kind":"bug","why":""}}')" 422
