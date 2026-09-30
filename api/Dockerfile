@@ -6,8 +6,10 @@ WORKDIR /build
 # sourced inside the same RUN as pip (so anything it exports, e.g.
 # PIP_INDEX_URL, applies to that command only and is never written to a layer).
 COPY requirements.txt pip-setup.s[h] ./
+# Wheels only, and every file must match a pinned hash (requirements.txt is
+# generated from requirements.in with pip-compile --generate-hashes).
 RUN if [ -f pip-setup.sh ]; then . ./pip-setup.sh; fi; \
-    pip install --no-cache-dir --prefix=/install -r requirements.txt
+    pip install --no-cache-dir --only-binary=:all: --require-hashes --prefix=/install -r requirements.txt
 
 
 FROM python:3.12-slim
