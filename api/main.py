@@ -444,6 +444,32 @@ async def delete_group(group_id: int):
     return {"ok": True}
 
 
+@app.get("/roles/{role}/groups")
+async def role_groups(role: str):
+    """The role's current groups, each with its ACTIVE threads: the one call
+    that replaces sessions walking /groups/{id}/members and /threads/{id}
+    to build their hub_groups.md memory file. Read-only. Groups the role has
+    left (left_at set) and archived threads are left out; a group with no
+    active threads is still listed, so the role knows it is a member."""
+    async with pool.acquire() as conn:
+        if not await conn.fetchval("SELECT 1 FROM roles WHERE role = $1", role):
+            raise HTTPException(404, f"role {role} does not exist")
+        rows = await conn.fetch(
+            "SELECT g.group_id, t.thread_id, t.topic "
+            "FROM group_members m JOIN groups g ON g.group_id = m.group_id "
+            "LEFT JOIN threads t ON t.group_id = g.group_id AND t.status = 'active' "
+            "WHERE m.role = $1 AND m.left_at IS NULL AND g.status = 'active' "
+            "ORDER BY g.group_id, t.thread_id",
+            role,
+        )
+    groups: dict[int, dict] = {}
+    for r in rows:
+        g = groups.setdefault(r["group_id"], {"group_id": r["group_id"], "threads": []})
+        if r["thread_id"] is not None:
+            g["threads"].append({"thread_id": r["thread_id"], "topic": r["topic"]})
+    return {"role": role, "groups": list(groups.values())}
+
+
 @app.get("/groups/{group_id}/members")
 async def group_members(group_id: int):
     async with pool.acquire() as conn:

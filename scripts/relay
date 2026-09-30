@@ -25,6 +25,7 @@ on another role's behalf (e.g. coordinator-claude's arbitrator duties).
 """
 import argparse
 import contextlib
+import datetime
 import io
 import json
 import os
@@ -164,6 +165,11 @@ def delete_group(group_id: int) -> None:
 
 def group_members(group_id: int) -> list[str]:
     return _request("GET", f"/groups/{group_id}/members")["members"]
+
+
+def get_role_groups(role: str) -> list[dict]:
+    """The role's groups, each with its active threads (see GET /roles/{role}/groups)."""
+    return _request("GET", f"/roles/{role}/groups")["groups"]
 
 
 def add_member(group_id: int, role: str) -> None:
@@ -367,6 +373,20 @@ def _cmd_history(args) -> None:
         print(f"#{m['message_id']} {m['created_at']} {m['sender_role']}: {_preview(m['body'])}{acked}")
 
 
+def _cmd_groups(args) -> None:
+    """Prints your hub_groups.md in the protocol's format; pair with --out to
+    write it straight into your memory directory."""
+    groups = get_role_groups(resolve_role(args.role))
+    if args.full:
+        print(json.dumps(groups, indent=2))
+        return
+    print(f"Last refreshed: {datetime.date.today().isoformat()}\n")
+    for g in groups:
+        print(f"- group {g['group_id']}")
+        for t in g["threads"]:
+            print(f"  - thread {t['thread_id']}: {json.dumps(t['topic'], ensure_ascii=False)}")
+
+
 def _cmd_attention(args) -> None:
     open_asks = open_attention()
     if args.full:
@@ -434,6 +454,11 @@ def _cli() -> None:
     hi.add_argument("thread_id", type=int)
     hi.add_argument("--full", action="store_true", help="print full JSON instead of one line per message")
     hi.set_defaults(func=_cmd_history)
+
+    gr = sub.add_parser("groups", help="your groups and their active threads, as hub_groups.md "
+                                       "(write it with: relay --out <memory-dir>/hub_groups.md groups)")
+    gr.add_argument("--full", action="store_true", help="print JSON instead")
+    gr.set_defaults(func=_cmd_groups)
 
     at = sub.add_parser("attention", help="open needs_operator asks (coordinator-claude/dashboard use)")
     at.add_argument("--full", action="store_true")

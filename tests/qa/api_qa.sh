@@ -68,6 +68,8 @@ eq "add operator as member 422"    "$(code -X POST $A/groups/$G/members -H 'Cont
 T=$(post /groups/$G/threads '{"topic":"QA run (coordinator-claude only, auto-deleted)"}' | jq -r .thread_id)
 [ "$T" -gt 0 ] 2>/dev/null && ok "create thread ($T)" || bad "create thread" "$T"
 eq "thread info group"         "$(curl -s $A/threads/$T | jq -r .group_id)" "$G"
+eq "role groups lists thread"  "$(curl -s $A/roles/$ME/groups | jq -c "[.groups[] | select(.group_id==$G) | .threads[] | select(.thread_id==$T) | .thread_id]")" "[$T]"
+eq "role groups unknown role 404" "$(code $A/roles/totally-unregistered-role/groups)" 404
 eq "lookup by topic"           "$(curl -s -G $A/groups/$G/threads/lookup --data-urlencode 'topic=QA run (coordinator-claude only, auto-deleted)' | jq -r .thread_id)" "$T"
 eq "post to missing thread 404" "$(code -X POST $A/threads/999999/messages -H 'Content-Type: application/json' -d '{"sender_role":"coordinator-claude","body":"x"}')" 404
 eq "unregistered sender 404"    "$(code -X POST $A/threads/$T/messages -H 'Content-Type: application/json' -d '{"sender_role":"totally-unregistered-role","body":"x"}')" 404
@@ -222,6 +224,8 @@ $W nonexistent-role 1 1 >/dev/null 2>&1; eq "never-bound role (nonexistent-role)
 
 echo "== archive"
 eq "archive"                   "$(post /threads/$T/archive '{}')" '{"ok":true}'
+eq "role groups drops archived thread" "$(curl -s $A/roles/$ME/groups | jq -c "[.groups[] | select(.group_id==$G) | .threads[] | select(.thread_id==$T)] | length")" 0
+eq "role groups keeps empty group" "$(curl -s $A/roles/$ME/groups | jq -c "[.groups[] | select(.group_id==$G)] | length")" 1
 eq "post to archived 409"      "$(code -X POST $A/threads/$T/messages -H 'Content-Type: application/json' -d '{"sender_role":"coordinator-claude","body":"x"}')" 409
 eq "history still readable"    "$(curl -s $A/threads/$T/history | jq '.messages|length>0')" true
 T_REOPEN=$(post /groups/$G/threads '{"topic":"QA run (coordinator-claude only, auto-deleted)"}' | jq -r .thread_id)
