@@ -193,7 +193,11 @@ Notes:
   SELECT/INSERT/UPDATE/DELETE on its database: the API creates and updates its
   own tables at startup, and sends no DDL at all when they already exist.
 - The connection pool holds at most `DATABASE_POOL_MAX` connections (default 4).
-- If the server needs a client certificate, the API re-reads `ssl_ca`, `ssl_cert`
+- **TLS to the database is optional and off by default.** A plain `DATABASE_URL`
+  (what the bundled compose setup uses) connects without TLS and needs no
+  certificate files; nothing below applies unless you add the `ssl*` options.
+  `tests/unit/test_db_options.py` guards this.
+- If you do enable TLS and the server needs a client certificate, the API re-reads `ssl_ca`, `ssl_cert`
   and `ssl_key` when their files change, so a rotated certificate is picked up
   without a restart. `ssl_check_hostname=false` keeps the chain check but skips
   the name match.

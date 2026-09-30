@@ -12,7 +12,8 @@ What it does for callers:
     returns the AUTO_INCREMENT id.
   * `retry_on_db_error` re-runs a whole request handler after a deadlock.
 
-DATABASE_URL: mysql://user:password@host:3306/dbname[?ssl=true][&ssl_ca=/path/ca.pem]
+DATABASE_URL: mysql://user:password@host:3306/dbname   (TLS is optional; plain by default)
+  with TLS: ...[?ssl=true][&ssl_ca=/path/ca.pem]
 [&ssl_cert=/path/client.pem&ssl_key=/path/client-key.pem]
 (`mariadb://` is accepted too). Percent-encode any of @ / : % in the password,
 or leave it out of the URL and put it in DATABASE_PASSWORD, which wins.
