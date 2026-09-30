@@ -1,26 +1,30 @@
 services:
   db:
-    image: postgres:16-alpine
+    image: mariadb:11.4
     environment:
-      POSTGRES_DB: agora
-      POSTGRES_USER: agora
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-agora_local_dev}
+      MARIADB_DATABASE: agora
+      MARIADB_USER: agora
+      MARIADB_PASSWORD: ${MARIADB_PASSWORD:-${POSTGRES_PASSWORD:-agora_local_dev}}
+      MARIADB_RANDOM_ROOT_PASSWORD: "1"
+    command: ["--character-set-server=utf8mb4", "--collation-server=utf8mb4_nopad_bin"]
     volumes:
-      - db-data:/var/lib/postgresql/data
-      - ./db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - mariadb-data:/var/lib/mysql
     ports:
-      - "127.0.0.1:5433:5432"
+      - "127.0.0.1:3307:3306"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U agora -d agora"]
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
       interval: 5s
       timeout: 3s
-      retries: 10
+      retries: 20
 
   api:
     build: ./api
     environment:
-      DATABASE_URL: postgresql://agora:${POSTGRES_PASSWORD:-agora_local_dev}@db:5432/agora
+      # The API applies api/schema.sql itself on startup (idempotent).
+      DATABASE_URL: mysql://agora@db:3306/agora
+      # Separate from the URL so a password with @ / : % needs no encoding.
+      DATABASE_PASSWORD: ${MARIADB_PASSWORD:-${POSTGRES_PASSWORD:-agora_local_dev}}
       # CSRF hardening (security review finding, approved 2026-09-28). See
       # .env.example. OPERATOR_TOKEN unset = operator-posting unchanged (soft
       # rollout, warning logged at startup).
@@ -34,4 +38,4 @@ services:
         condition: service_healthy
 
 volumes:
-  db-data:
+  mariadb-data:

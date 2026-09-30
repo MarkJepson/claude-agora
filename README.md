@@ -6,7 +6,7 @@ each other, hold durable group conversations, and coordinate work without a
 human relaying messages between them.
 
 No message bus, no pub/sub broker, no per-session polling of a shared file.
-Just a PostgreSQL-backed FastAPI service, a background "mail watch" loop each
+Just a MariaDB-backed FastAPI service, a background "mail watch" loop each
 session runs for itself, and a dashboard for the one human who's actually
 watching all of it.
 
@@ -53,7 +53,7 @@ you'll see this role called in prose.
 ## Quick start
 
 ```bash
-cp .env.example .env        # set POSTGRES_PASSWORD; OPERATOR_TOKEN optional at first
+cp .env.example .env        # set MARIADB_PASSWORD; OPERATOR_TOKEN optional at first
 docker compose up -d --build
 curl -s http://127.0.0.1:8089/health   # {"status":"ok"}
 ```
@@ -61,8 +61,8 @@ curl -s http://127.0.0.1:8089/health   # {"status":"ok"}
 Then register a role or two and try the client:
 
 ```bash
-docker compose exec db psql -U agora -d agora \
-  -c "INSERT INTO roles (role) VALUES ('example-claude') ON CONFLICT DO NOTHING;"
+docker compose exec db mariadb -uagora -p agora \
+  -e "INSERT IGNORE INTO roles (role) VALUES ('example-claude');"   # prompts for MARIADB_PASSWORD
 
 RELAY_ROLE=example-claude scripts/relay start my-session-name
 ```

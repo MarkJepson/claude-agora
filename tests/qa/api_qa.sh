@@ -25,14 +25,17 @@ bad()  { FAIL=$((FAIL+1)); echo "FAIL  $1  -- $2"; }
 eq()   { [ "$2" = "$3" ] && ok "$1" || bad "$1" "expected [$3] got [$2]"; }
 code() { curl -s -o /tmp/qa_body -w '%{http_code}' -H 'X-Relay-Client: qa' ${OPH[@]+"${OPH[@]}"} "$@"; }
 post() { curl -s -X POST "$A$1" -H 'Content-Type: application/json' -H 'X-Relay-Client: qa' ${OPH[@]+"${OPH[@]}"} -d "$2"; }
-db()   { (cd "$REPO_ROOT" && docker compose exec -T db psql -U agora -d agora -At -c "$1"); }
+# Runs SQL in the relay's MariaDB container (-N -B: no headers, tab-separated;
+# booleans print as 1/0, NULL as NULL). COMPOSE_PROJECT_NAME picks a non-default
+# compose project. The password comes from the container, never the command line.
+db()   { (cd "$REPO_ROOT" && docker compose exec -T -e MYSQL_PWD="$(docker compose exec -T db printenv MARIADB_PASSWORD | tr -d '\r')" db mariadb -uagora agora -N -B -e "$1"); }
 mine() { curl -s "$A/roles/$ME/pending?peek=true" | jq -c "[.pending[] | select(.thread_id==$T) | .message_id]"; }
 
 # Roles this suite exercises. Registering a role has no API (deliberately
 # -- see BUILD.md), so QA seeds its own via direct insert, same as a human
 # operator would for a real role.
 for r in coordinator-claude architect-claude security-claude observability-claude; do
-  db "INSERT INTO roles (role) VALUES ('$r') ON CONFLICT DO NOTHING" >/dev/null
+  db "INSERT IGNORE INTO roles (role) VALUES ('$r')" >/dev/null
 done
 
 echo "== health / routes"
@@ -63,7 +66,7 @@ GABC=$(echo "$R" | jq -r .group_id)
 [ "$GABC" -gt 0 ] 2>/dev/null && ok "create/get group {security,architect,coordinator}" || bad "create/get group {security,architect,coordinator}" "$R"
 eq "duplicates collapse -> existing" "$(post /groups '{"members":["coordinator-claude","architect-claude","security-claude","coordinator-claude"]}' | jq -c '[.group_id,.existing]')" "[$GABC,true]"
 eq "empty members 422"         "$(code -X POST $A/groups -H 'Content-Type: application/json' -d '{"members":[]}')" 422
-PRE=$(db "SELECT g.group_id FROM groups g JOIN group_members gm USING (group_id) WHERE gm.left_at IS NULL AND g.status='active' GROUP BY g.group_id HAVING array_agg(gm.role) = ARRAY['$ME']" | head -1)
+PRE=$(db "SELECT g.group_id FROM \`groups\` g JOIN group_members gm USING (group_id) WHERE gm.left_at IS NULL AND g.status='active' GROUP BY g.group_id HAVING COUNT(*) = 1 AND MAX(gm.role) = '$ME'" | head -1)
 R=$(post /groups "{\"members\":[\"$ME\"]}")
 G=$(echo "$R" | jq -r .group_id)
 if [ -z "$PRE" ]; then eq "one-member group created (existing=false)" "$(echo "$R" | jq -r .existing)" false
@@ -77,6 +80,18 @@ eq "thread info group"         "$(curl -s $A/threads/$T | jq -r .group_id)" "$G"
 eq "role groups lists thread"  "$(curl -s $A/roles/$ME/groups | jq -c "[.groups[] | select(.group_id==$G) | .threads[] | select(.thread_id==$T) | .thread_id]")" "[$T]"
 eq "role groups unknown role 404" "$(code $A/roles/totally-unregistered-role/groups)" 404
 eq "lookup by topic"           "$(curl -s -G $A/groups/$G/threads/lookup --data-urlencode 'topic=QA run (coordinator-claude only, auto-deleted)' | jq -r .thread_id)" "$T"
+# Storage-engine specifics: 4-byte characters, case-sensitive text, the
+# race guard on group get-or-create, and UTC timestamp format.
+UT=$(post /groups/$G/threads '{"topic":"QA Ünïcode 🎉 Topic"}' | jq -r .thread_id)
+eq "emoji topic round-trips"     "$(curl -s $A/threads/$UT | jq -r .topic)" "QA Ünïcode 🎉 Topic"
+eq "topic lookup exact"          "$(curl -s -G $A/groups/$G/threads/lookup --data-urlencode 'topic=QA Ünïcode 🎉 Topic' | jq -r .thread_id)" "$UT"
+eq "topic lookup is case-sensitive" "$(curl -s -G $A/groups/$G/threads/lookup --data-urlencode 'topic=qa ünïcode 🎉 topic' | jq -r .thread_id)" null
+eq "timestamps are UTC ISO"      "$(curl -s $A/threads/$UT >/dev/null; curl -s $A/roles/$ME | jq -r '.bound_at | test("(Z|[+]00:00)$")')" true
+RACE=$(for i in 1 2 3 4 5 6 7 8; do post /groups '{"members":["coordinator-claude","observability-claude"]}' & done; wait)
+eq "concurrent group get-or-create -> one group" "$(echo "$RACE" | jq -r .group_id | sort -u | wc -l | tr -d ' ')" 1
+RACE_NEW=$(echo "$RACE" | jq -r 'select(.existing==false) | .group_id' | head -1)
+[ "$(echo "$RACE" | jq -r 'select(.existing==false)' | grep -c group_id)" -le 1 ] && ok "at most one of the racers created it" || bad "at most one of the racers created it" "$RACE"
+[ -n "$RACE_NEW" ] && curl -s -o /dev/null -X DELETE -H 'X-Relay-Client: qa' $A/groups/$RACE_NEW   # only remove a group this run created
 eq "post to missing thread 404" "$(code -X POST $A/threads/999999/messages -H 'Content-Type: application/json' -d '{"sender_role":"coordinator-claude","body":"x"}')" 404
 eq "unregistered sender 404"    "$(code -X POST $A/threads/$T/messages -H 'Content-Type: application/json' -d '{"sender_role":"totally-unregistered-role","body":"x"}')" 404
 eq "unregistered bind 404"      "$(code -X POST $A/roles/totally-unregistered-role/bind -H 'Content-Type: application/json' -d '{"session_name":"x"}')" 404
@@ -135,7 +150,7 @@ eq "non-operator answers 403"  "$(code -X POST $A/threads/$T/messages -H 'Conten
 AN=$(post /threads/$T/messages "{\"sender_role\":\"operator\",\"body\":\"QA answer to $ASK1.\",\"answers\":$ASK1}" | jq -r .message_id)
 eq "answered_by recorded"      "$(db "SELECT attn_answered_by FROM messages WHERE message_id=$ASK1")" "$AN"
 eq "answer to non-ask is harmless" "$(post /threads/$T/messages "{\"sender_role\":\"operator\",\"body\":\"QA reply to plain.\",\"answers\":$M1}" | jq -r 'has("message_id")')" true
-eq "plain msg stays unflagged" "$(db "SELECT attn_kind IS NULL AND attn_answered_by IS NULL FROM messages WHERE message_id=$M1")" t
+eq "plain msg stays unflagged" "$(db "SELECT attn_kind IS NULL AND attn_answered_by IS NULL FROM messages WHERE message_id=$M1")" 1
 eq "clear ask2"                "$(post /messages/$ASK2/attention/clear '{}')" '{"ok":true}'
 eq "clear ask2 again 404"      "$(code -X POST $A/messages/$ASK2/attention/clear)" 404
 eq "clear non-flagged 404"     "$(code -X POST $A/messages/$M1/attention/clear)" 404
@@ -154,14 +169,14 @@ eq "read M1"                   "$(post "/messages/$M1/read?role=$ME" '{}')" '{"o
 eq "re-read M1 409"            "$(code -X POST "$A/messages/$M1/read?role=$ME")" 409
 eq "last action on read"       "$(db "SELECT last_seen_action FROM roles WHERE role='$ME'")" "read #$M1"
 eq "ack AN"                    "$(post "/messages/$AN/ack?role=$ME" '{}')" '{"ok":true}'
-eq "ack sets read too"         "$(db "SELECT read_at IS NOT NULL AND ack_at IS NOT NULL FROM deliveries WHERE message_id=$AN AND recipient_role='$ME'")" t
+eq "ack sets read too"         "$(db "SELECT read_at IS NOT NULL AND ack_at IS NOT NULL FROM deliveries WHERE message_id=$AN AND recipient_role='$ME'")" 1
 eq "re-ack AN 409"             "$(code -X POST "$A/messages/$AN/ack?role=$ME")" 409
 eq "history acked_by"          "$(curl -s $A/threads/$T/history | jq -c ".messages[] | select(.message_id==$AN) | .acked_by")" "[\"$ME\"]"
 eq "pending drops read/acked"  "$(mine | jq length)" 1
 eq "read by non-recipient 404" "$(code -X POST "$A/messages/$M1/read?role=observability-claude")" 404
 eq "read missing message 404"  "$(code -X POST "$A/messages/99999999/read?role=$ME")" 404
 eq "ack by non-recipient 404"  "$(code -X POST "$A/messages/$M1/ack?role=observability-claude")" 404
-eq "404s don't touch observability-claude"     "$(db "SELECT coalesce(last_seen_action,'') NOT LIKE '%$M1%' FROM roles WHERE role='observability-claude'")" t
+eq "404s don't touch observability-claude"     "$(db "SELECT coalesce(last_seen_action,'') NOT LIKE '%$M1%' FROM roles WHERE role='observability-claude'")" 1
 eq "role in body 422"          "$(code -X POST $A/messages/$M1/read -H 'Content-Type: application/json' -d "{\"role\":\"$ME\"}")" 422
 
 echo "== delivered (WhatsApp-style)"
@@ -195,10 +210,10 @@ eq "incremental: ack change seen" "$(echo "$I2" | jq -c "[.deliveries[] | select
 
 echo "== heartbeat"
 eq "heartbeat bad interval 422" "$(code -X POST "$A/roles/$ME/heartbeat?interval=0")" 422
-ACT0=$(db "SELECT last_action_at||' '||last_seen_action FROM roles WHERE role='$ME'")
+ACT0=$(db "SELECT CONCAT_WS(' ', last_action_at, last_seen_action) FROM roles WHERE role='$ME'")
 eq "heartbeat ok"              "$(post "/roles/$ME/heartbeat?interval=20" '{}')" '{"ok":true}'
-eq "heartbeat sets heartbeat_at/interval/last_seen" "$(db "SELECT heartbeat_at > now() - interval '5 seconds' AND heartbeat_interval = 20 AND last_seen_at = heartbeat_at FROM roles WHERE role='$ME'")" t
-eq "heartbeat leaves last action" "$(db "SELECT last_action_at||' '||last_seen_action FROM roles WHERE role='$ME'")" "$ACT0"
+eq "heartbeat sets heartbeat_at/interval/last_seen" "$(db "SELECT heartbeat_at > UTC_TIMESTAMP(6) - INTERVAL 5 SECOND AND heartbeat_interval = 20 AND last_seen_at = heartbeat_at FROM roles WHERE role='$ME'")" 1
+eq "heartbeat leaves last action" "$(db "SELECT CONCAT_WS(' ', last_action_at, last_seen_action) FROM roles WHERE role='$ME'")" "$ACT0"
 
 echo "== mailwatch.sh"
 NOW=$(db "SELECT max(message_id) FROM messages")
@@ -213,7 +228,7 @@ MW=$(jq -r .message_id /tmp/qa_trig)
 eq "wakes on new mail (exit 0)" "$RC" 0
 grep -q "msg $MW in thread $T from operator" /tmp/qa_watch2 && ok "prints the new msg id" || bad "prints the new msg id" "$(cat /tmp/qa_watch2)"
 grep -q "$ME $MW\$" /tmp/qa_watch2 && ok "prints concrete re-arm id" || bad "prints concrete re-arm id" "$(tail -1 /tmp/qa_watch2)"
-eq "marks it delivered, not read" "$(db "SELECT delivered_at IS NOT NULL AND read_at IS NULL FROM deliveries WHERE message_id=$MW AND recipient_role='$ME'")" t
+eq "marks it delivered, not read" "$(db "SELECT delivered_at IS NOT NULL AND read_at IS NULL FROM deliveries WHERE message_id=$MW AND recipient_role='$ME'")" 1
 UND=$(post /threads/$T/messages '{"sender_role":"operator","body":"QA undelivered, below the re-arm id."}' | jq -r .message_id)
 FUT=$(( UND + 1000 ))
 timeout 8 $W $ME $FUT 2 >/tmp/qa_watch4; RC=$?
@@ -225,7 +240,7 @@ eq "id <= after that appears later wakes" "$RC" 0
 grep -q "msg $(jq -r .message_id /tmp/qa_trig2) " /tmp/qa_watch3 && ok "  ...and names it" || bad "  ...and names it" "$(cat /tmp/qa_watch3)"
 HB0=$(db "SELECT heartbeat_at FROM roles WHERE role='$ME'")
 sleep 1; timeout 4 $W $ME 999999999 1 >/dev/null 2>&1
-eq "watch loop sends heartbeats" "$(db "SELECT heartbeat_at > '$HB0' AND heartbeat_interval = 1 FROM roles WHERE role='$ME'")" t
+eq "watch loop sends heartbeats" "$(db "SELECT heartbeat_at > '$HB0' AND heartbeat_interval = 1 FROM roles WHERE role='$ME'")" 1
 post "/roles/$ME/heartbeat?interval=20" '{}' >/dev/null
 RELAY_URL=http://127.0.0.1:1 timeout 5 $W $ME 0 1 >/dev/null 2>&1; eq "keeps waiting when relay down" "$?" 124
 eq "usage error"               "$($W 2>&1 >/dev/null | grep -c usage)" 1
@@ -250,7 +265,7 @@ echo "== 1000-message cap (first-load /api/dashboard/state)"
 CAP_G=$(post /groups '{"members":["coordinator-claude","architect-claude"]}' | jq -r .group_id)
 CAP_T=$(post /groups/$CAP_G/threads '{"topic":"QA message-cap thread (auto-deleted)"}' | jq -r .thread_id)
 CAP_ASK=$(post /threads/$CAP_T/messages '{"sender_role":"coordinator-claude","body":"QA: old open ask that must survive the cap.","needs_operator":{"kind":"decision","why":"QA: cap coverage"}}' | jq -r .message_id)
-db "INSERT INTO messages (thread_id, sender_role, body) SELECT $CAP_T, 'coordinator-claude', 'QA cap filler ' || g FROM generate_series(1, 1005) g" >/dev/null
+db "INSERT INTO messages (thread_id, sender_role, body) SELECT $CAP_T, 'coordinator-claude', CONCAT('QA cap filler ', seq) FROM seq_1_to_1005" >/dev/null
 STATE=$(curl -s "$A/api/dashboard/state")
 eq "old open ask's message is still loaded past the cap" \
   "$(echo "$STATE" | jq "[.messages[].message_id] | index($CAP_ASK) != null")" true
