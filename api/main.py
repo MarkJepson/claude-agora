@@ -123,7 +123,9 @@ def _check_operator_token(request: Request, what: str = "this") -> None:
     if not _OPERATOR_TOKEN:
         return
     supplied = request.headers.get("x-operator-token", "")
-    if not hmac.compare_digest(supplied, _OPERATOR_TOKEN):
+    # Compare bytes: compare_digest raises TypeError on non-ASCII str (a 500), and
+    # a wrong token of any kind must be a plain 403.
+    if not hmac.compare_digest(supplied.encode(), _OPERATOR_TOKEN.encode()):
         raise HTTPException(403, f"{what} requires a valid X-Operator-Token header")
 
 
@@ -153,6 +155,11 @@ async def _require_roles_exist(conn: agora_db.Conn, roles: list[str]) -> None:
 async def startup() -> None:
     global pool
     _check_operator_token_config()
+    if _OPERATOR_TOKEN and len(_OPERATOR_TOKEN) < 32:
+        log.warning(
+            "OPERATOR_TOKEN is only %d characters; use a long random value (e.g. `openssl rand -hex 32`).",
+            len(_OPERATOR_TOKEN),
+        )
     if not _OPERATOR_TOKEN:
         log.warning(
             "OPERATOR_TOKEN not set -- sender_role='operator' is NOT restricted to the dashboard yet. "

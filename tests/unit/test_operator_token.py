@@ -29,7 +29,34 @@ def load(token, require=None):
     return importlib.import_module("main")
 
 
+class _Req:
+    def __init__(self, token):
+        self.headers = {} if token is None else {"x-operator-token": token}
+
+
 class OperatorToken(unittest.TestCase):
+    def check(self, mod, supplied):
+        """Runs the real check; returns the HTTP status it raises, or 200."""
+        from fastapi import HTTPException
+        try:
+            mod._check_operator_token(_Req(supplied))
+            return 200
+        except HTTPException as e:
+            return e.status_code
+
+    def test_wrong_and_missing_token_is_403(self):
+        m = load("s3cret-token-value")
+        self.assertEqual(self.check(m, "nope"), 403)
+        self.assertEqual(self.check(m, None), 403)
+        self.assertEqual(self.check(m, ""), 403)
+
+    def test_non_ascii_token_is_403_not_a_crash(self):
+        m = load("s3cret-token-value")
+        self.assertEqual(self.check(m, "t\u00f6ken-\u2603"), 403)
+
+    def test_correct_token_passes(self):
+        self.assertEqual(self.check(load("s3cret-token-value\n"), "s3cret-token-value"), 200)
+
     def test_trailing_newline_is_ignored(self):
         self.assertEqual(load("abc123\n")._OPERATOR_TOKEN, "abc123")
 
