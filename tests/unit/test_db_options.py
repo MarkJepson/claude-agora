@@ -10,7 +10,11 @@ import sys
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "api"))
+_here = Path(__file__).resolve()
+for _d in [p / "api" for p in _here.parents] + [Path("/app")]:
+    if (_d / "agora_db.py").exists():
+        sys.path.insert(0, str(_d))
+        break
 import aiomysql  # noqa: E402
 
 import agora_db  # noqa: E402

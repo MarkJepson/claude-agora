@@ -185,7 +185,8 @@ The API reads its settings from environment variables:
 | Env var | Meaning |
 |---|---|
 | `DATABASE_URL` | `mysql://user:password@host:3306/agora`, optionally `?ssl=true`, `?ssl_ca=/path/ca.pem`, and for a server that requires a client certificate `&ssl_cert=/path/client.pem&ssl_key=/path/client-key.pem`. Percent-encode any `@ / : %` in the password, or omit it from the URL and set `DATABASE_PASSWORD` instead (it wins). |
-| `OPERATOR_TOKEN` | The dashboard's operator secret. |
+| `OPERATOR_TOKEN` | The dashboard's operator secret. Surrounding whitespace (such as a trailing newline from a secret made from a file) is ignored; a blank value counts as not set. |
+| `REQUIRE_OPERATOR_TOKEN` | Optional. Set to `true` and the relay refuses to start unless `OPERATOR_TOKEN` is non-blank, so operator posts can never end up unrestricted by accident. Off by default. |
 | `RELAY_ALLOWED_HOSTS` | Comma-separated `host:port` values the relay is reached as. Requests with any other `Host` header are rejected. |
 
 Notes:
