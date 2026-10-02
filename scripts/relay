@@ -232,8 +232,8 @@ def mark_delivered_batch(message_id: int, recipient_roles: list[str]) -> None:
 def mark_read(message_id: int, recipient_role: str) -> None:
     """The 'calling off' step: after pending_for_role() gives you the
     list, work through it in order and call this once per message as you
-    process each one. Per-message, not bulk -- read_at means 'processed
-    this one', not 'fetched a list containing it'. read_at is immutable:
+    process each one. read_at means 'processed this one', not 'fetched a
+    list containing it'; mark_read_batch is the bulk form. read_at is immutable:
     a repeat read raises (API 409, "already marked as read by you at
     <timestamp>") rather than overwriting the original time."""
     _request("POST", f"/messages/{message_id}/read", params={"role": recipient_role})
@@ -277,6 +277,29 @@ def clear_attention(message_id: int) -> None:
     token = os.environ.get("OPERATOR_TOKEN")
     headers = {"X-Operator-Token": token} if token else None
     _request("POST", f"/messages/{message_id}/attention/clear", headers=headers)
+
+
+def mark_read_batch(message_ids: list[int], recipient_role: str) -> dict:
+    return _request("POST", f"/roles/{recipient_role}/read-batch", json_body={"message_ids": message_ids})
+
+
+def ack_batch(message_ids: list[int], recipient_role: str) -> dict:
+    return _request("POST", f"/roles/{recipient_role}/ack-batch", json_body={"message_ids": message_ids})
+
+
+def mark_delivered_ids_batch(message_ids: list[int], recipient_role: str) -> dict:
+    return _request("POST", f"/roles/{recipient_role}/delivered-batch", json_body={"message_ids": message_ids})
+
+
+def archive_threads_batch(thread_ids: list[int]) -> dict:
+    return _request("POST", "/threads/archive-batch", json_body={"thread_ids": thread_ids})
+
+
+def clear_attention_batch(message_ids: list[int]) -> dict:
+    token = os.environ.get("OPERATOR_TOKEN")
+    headers = {"X-Operator-Token": token} if token else None
+    return _request("POST", "/messages/attention/clear-batch",
+                    json_body={"message_ids": message_ids}, headers=headers)
 
 
 # ---------------------------------------------------------------------------
@@ -436,6 +459,14 @@ def _cli() -> None:
                      help=argparse.SUPPRESS)  # old relay.py CLI: `ack <message_id> <role>`
     ak.set_defaults(func=_cmd_ack)
 
+    rdb = sub.add_parser("read-batch", help="mark several messages processed")
+    rdb.add_argument("message_ids", type=int, nargs="+")
+    rdb.set_defaults(func=lambda a: print(json.dumps(mark_read_batch(a.message_ids, resolve_role(a.role)))))
+
+    akb = sub.add_parser("ack-batch", help="thumbs-up several messages")
+    akb.add_argument("message_ids", type=int, nargs="+")
+    akb.set_defaults(func=lambda a: print(json.dumps(ack_batch(a.message_ids, resolve_role(a.role)))))
+
     po = sub.add_parser("post", help="post into a thread")
     po.add_argument("thread_id", type=int)
     po.add_argument("text", nargs="*", help="body text (or use --file / stdin)")
@@ -494,6 +525,12 @@ def _cli() -> None:
     md.set_defaults(func=lambda a: mark_delivered(a.message_id, a.role))
     mdb = sub.add_parser("delivered-batch"); mdb.add_argument("message_id", type=int); mdb.add_argument("roles", nargs="+")
     mdb.set_defaults(func=lambda a: mark_delivered_batch(a.message_id, a.roles))
+    mdi = sub.add_parser("delivered-ids"); mdi.add_argument("role"); mdi.add_argument("message_ids", type=int, nargs="+")
+    mdi.set_defaults(func=lambda a: print(json.dumps(mark_delivered_ids_batch(a.message_ids, a.role))))
+    arb = sub.add_parser("archive-threads"); arb.add_argument("thread_ids", type=int, nargs="+")
+    arb.set_defaults(func=lambda a: print(json.dumps(archive_threads_batch(a.thread_ids))))
+    cab = sub.add_parser("clear-attention-batch"); cab.add_argument("message_ids", type=int, nargs="+")
+    cab.set_defaults(func=lambda a: print(json.dumps(clear_attention_batch(a.message_ids))))
     ar = sub.add_parser("archive-thread"); ar.add_argument("thread_id", type=int)
     ar.set_defaults(func=lambda a: archive_thread(a.thread_id))
     ca = sub.add_parser("clear-attention"); ca.add_argument("message_id", type=int)

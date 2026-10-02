@@ -219,6 +219,17 @@ class DeliveredBatchRequest(BaseModel):
     roles: list[str]
 
 
+MAX_BATCH = 500
+
+
+class MessageIdsRequest(BaseModel):
+    message_ids: list[int] = Field(min_length=1, max_length=MAX_BATCH)
+
+
+class ThreadIdsRequest(BaseModel):
+    thread_ids: list[int] = Field(min_length=1, max_length=MAX_BATCH)
+
+
 @app.post("/roles/{role}/bind")
 @retry_on_db_error
 async def bind_role(role: str, req: BindRequest):
@@ -578,6 +589,117 @@ async def clear_attention(message_id: int, request: Request):
     return {"ok": True}
 
 
+async def _mark_batch(conn: agora_db.Conn, role: str, message_ids: list[int], col: str, now) -> dict:
+    """Shared body of the read/ack/delivered batches. Per-id outcome rather than
+    all-or-nothing, and a repeat is reported as `already` (200) instead of the
+    single-message 409, so a retried batch is safe. The first timestamp is kept.
+    `col` is one of our own column names, never user input."""
+    ids = list(dict.fromkeys(message_ids))
+    rows = await conn.fetch(
+        f"""SELECT message_id, {col} AS ts FROM deliveries
+            WHERE recipient_role = $1 AND message_id IN ({ph(2, len(ids))})""",
+        role, *ids,
+    )
+    have = {r["message_id"]: r["ts"] for r in rows}
+    todo = [i for i in ids if i in have and have[i] is None]
+    if todo:
+        extra = ", read_at = COALESCE(read_at, $1)" if col == "ack_at" else ""
+        await conn.execute(
+            f"""UPDATE deliveries SET {col} = $1{extra}
+                WHERE recipient_role = $2 AND {col} IS NULL
+                      AND message_id IN ({ph(3, len(todo))})""",
+            now, role, *todo,
+        )
+    return {
+        "ok": True,
+        "updated": todo,
+        "already": [i for i in ids if i in have and have[i] is not None],
+        "not_recipient": [i for i in ids if i not in have],
+    }
+
+
+@app.post("/roles/{role}/read-batch")
+@retry_on_db_error
+async def mark_read_batch(role: str, req: MessageIdsRequest):
+    """Bulk form of POST /messages/{id}/read. Same meaning (this session
+    processed these messages) and same immutability: already-read ids are
+    reported under `already`, not overwritten. Ids the role isn't a
+    recipient of come back under `not_recipient`; nothing 404s."""
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            out = await _mark_batch(conn, role, req.message_ids, "read_at", _now())
+            await _touch(conn, role, f"read {len(out['updated'])} messages")
+    return out
+
+
+@app.post("/roles/{role}/ack-batch")
+@retry_on_db_error
+async def ack_batch(role: str, req: MessageIdsRequest):
+    """Bulk form of POST /messages/{id}/ack (also sets read_at). Same
+    result shape and idempotence as read-batch."""
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            out = await _mark_batch(conn, role, req.message_ids, "ack_at", _now())
+            await _touch(conn, role, f"acked {len(out['updated'])} messages")
+    return out
+
+
+@app.post("/roles/{role}/delivered-batch")
+@retry_on_db_error
+async def mark_delivered_ids_batch(role: str, req: MessageIdsRequest):
+    """Mark many messages delivered to one role (what mailwatch.sh does when
+    it wakes a session on several). Like /messages/{id}/delivered it is not
+    the role acting, so it doesn't touch last-seen."""
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            return await _mark_batch(conn, role, req.message_ids, "delivered_at", _now())
+
+
+@app.post("/threads/archive-batch")
+@retry_on_db_error
+async def archive_threads_batch(req: ThreadIdsRequest):
+    """Bulk form of POST /threads/{id}/archive (the weekly sweep). Unknown
+    ids come back under `not_found`; already-archived ones are fine."""
+    ids = list(dict.fromkeys(req.thread_ids))
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            rows = await conn.fetch(
+                f"SELECT thread_id FROM threads WHERE thread_id IN ({ph(1, len(ids))})", *ids,
+            )
+            found = {r["thread_id"] for r in rows}
+            if found:
+                await conn.execute(
+                    f"UPDATE threads SET status = 'archived' WHERE thread_id IN ({ph(1, len(found))})",
+                    *found,
+                )
+    return {"ok": True, "archived": [i for i in ids if i in found],
+            "not_found": [i for i in ids if i not in found]}
+
+
+@app.post("/messages/attention/clear-batch")
+@retry_on_db_error
+async def clear_attention_batch(req: MessageIdsRequest, request: Request):
+    """Bulk form of POST /messages/{id}/attention/clear, with the same
+    operator-only gate. Ids with no open flag come back under `not_open`."""
+    _check_operator_token(request, "clearing an attention flag")
+    ids = list(dict.fromkeys(req.message_ids))
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            rows = await conn.fetch(
+                f"""SELECT message_id FROM messages
+                    WHERE attn_kind IS NOT NULL AND attn_cleared_at IS NULL
+                          AND message_id IN ({ph(1, len(ids))})""",
+                *ids,
+            )
+            open_ids = [r["message_id"] for r in rows]
+            if open_ids:
+                await conn.execute(
+                    f"UPDATE messages SET attn_cleared_at = $1 WHERE message_id IN ({ph(2, len(open_ids))})",
+                    _now(), *open_ids,
+                )
+    return {"ok": True, "cleared": open_ids, "not_open": [i for i in ids if i not in set(open_ids)]}
+
+
 @app.get("/attention")
 async def open_attention():
     """Open needs_operator asks: not answered and not cleared, oldest first."""
@@ -631,9 +753,10 @@ async def mark_delivered_batch(message_id: int, req: DeliveredBatchRequest):
 async def mark_read(message_id: int, role: str):
     """The 'calling off' step: a session works through its GET /pending
     list in order and calls this once per message as it processes each
-    one. Deliberately per-message, not bulk -- read_at should mean 'this
-    session actually processed this one message', not 'this session
-    fetched a list that happened to include it'.
+    one. read_at should mean 'this session actually processed this message',
+    not 'fetched a list that happened to include it'; POST
+    /roles/{role}/read-batch is the bulk form for when a session has
+    genuinely processed several.
 
     read_at is immutable once set (design decision, 2026-09-25): a repeat read 409s
     with the original timestamp rather than overwriting it. Overwriting

@@ -28,6 +28,7 @@ import os
 import re
 import ssl
 import time
+import warnings
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -340,7 +341,12 @@ async def apply_schema(conn: Conn, path: Path) -> int:
         is_ddl = stmt.split(None, 1)[0].upper() in ("CREATE", "ALTER", "DROP", "RENAME", "TRUNCATE")
         for attempt in range(1, 6):
             try:
-                await conn.execute(stmt)
+                with warnings.catch_warnings():
+                    # INSERT IGNORE of a row that already exists (the seeded
+                    # 'operator' role) is a server warning, expected on every
+                    # restart; don't print it.
+                    warnings.filterwarnings("ignore", message="Duplicate entry", category=pymysql.err.Warning)
+                    await conn.execute(stmt)
                 sent += is_ddl
                 break
             except pymysql.err.MySQLError as e:

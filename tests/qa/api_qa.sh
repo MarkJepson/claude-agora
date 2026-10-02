@@ -191,6 +191,26 @@ D0=$(db "SELECT delivered_at FROM deliveries WHERE message_id=$LEFT AND recipien
 post "/messages/$LEFT/delivered?role=$ME" '{}' >/dev/null
 eq "first delivered_at is kept" "$(db "SELECT delivered_at FROM deliveries WHERE message_id=$LEFT AND recipient_role='$ME'")" "$D0"
 
+echo "== batch endpoints"
+BM=(); for i in 1 2 3 4; do BM+=("$(post /threads/$T/messages "{\"sender_role\":\"operator\",\"body\":\"batch QA $i\"}" | jq -r .message_id)"); done
+eq "read-batch: updated/not_recipient" "$(post /roles/$ME/read-batch "{\"message_ids\":[${BM[0]},${BM[1]},99999999]}" | jq -c '[.updated,.already,.not_recipient]')" "[[${BM[0]},${BM[1]}],[],[99999999]]"
+eq "read-batch: repeat is already, 200" "$(post /roles/$ME/read-batch "{\"message_ids\":[${BM[0]}]}" | jq -c '[.updated,.already]')" "[[],[${BM[0]}]]"
+eq "read-batch: pending drops them" "$(mine | jq -c "[.[] | select(. == ${BM[0]} or . == ${BM[1]})]")" "[]"
+eq "read-batch: last action"    "$(db "SELECT last_seen_action FROM roles WHERE role='$ME'")" "read 0 messages"
+eq "ack-batch"                  "$(post /roles/$ME/ack-batch "{\"message_ids\":[${BM[2]},${BM[3]}]}" | jq -c .updated)" "[${BM[2]},${BM[3]}]"
+eq "ack-batch sets read too"    "$(db "SELECT count(*) FROM deliveries WHERE message_id IN (${BM[2]},${BM[3]}) AND recipient_role='$ME' AND read_at IS NOT NULL AND ack_at IS NOT NULL")" 2
+eq "ack-batch repeat is already" "$(post /roles/$ME/ack-batch "{\"message_ids\":[${BM[2]}]}" | jq -c .already)" "[${BM[2]}]"
+eq "delivered-batch (ids)"      "$(post /roles/$ME/delivered-batch "{\"message_ids\":[${BM[0]},${BM[2]}]}" | jq -c '[.updated,.already]')" "[[${BM[0]},${BM[2]}],[]]"
+eq "empty ids 422"              "$(code -X POST $A/roles/$ME/read-batch -H 'Content-Type: application/json' -d '{"message_ids":[]}')" 422
+eq "too many ids 422"           "$(code -X POST $A/roles/$ME/read-batch -H 'Content-Type: application/json' -d "{\"message_ids\":$(jq -nc '[range(1;502)]')}")" 422
+BA=$(post /threads/$T/messages '{"sender_role":"operator","body":"batch ask A","needs_operator":{"kind":"other","why":"QA batch"}}' | jq -r .message_id)
+BB=$(post /threads/$T/messages '{"sender_role":"operator","body":"batch ask B","needs_operator":{"kind":"other","why":"QA batch"}}' | jq -r .message_id)
+eq "clear-attention-batch"      "$(post /messages/attention/clear-batch "{\"message_ids\":[$BA,$BB,${BM[0]}]}" | jq -c '[.cleared,.not_open]')" "[[$BA,$BB],[${BM[0]}]]"
+eq "clear-attention-batch needs operator token" "$(curl -s -o /dev/null -w '%{http_code}' -X POST $A/messages/attention/clear-batch -H 'Content-Type: application/json' -H 'X-Relay-Client: qa' -d "{\"message_ids\":[$BA]}")" "$([ -n "$OPERATOR_TOKEN" ] && echo 403 || echo 200)"
+BT=$(post /groups/$G/threads '{"topic":"QA batch archive (auto-deleted with group)"}' | jq -r .thread_id)
+eq "archive-batch"              "$(post /threads/archive-batch "{\"thread_ids\":[$BT,99999999]}" | jq -c '[.archived,.not_found]')" "[[$BT],[99999999]]"
+eq "archive-batch took effect"  "$(code -X POST "$A/threads/$BT/messages" -H 'Content-Type: application/json' -d '{"sender_role":"coordinator-claude","body":"x"}')" 409
+
 echo "== dashboard state"
 S=$(curl -s $A/api/dashboard/state)
 eq "state keys"                "$(echo "$S" | jq -c 'keys')" '["attention","deliveries","groups","message_counts","messages","roles","server_time","threads"]'
