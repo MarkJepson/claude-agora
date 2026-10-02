@@ -8,6 +8,7 @@ messages about one specific topic, and belongs to exactly one group.
 Membership lives on the group; topic and message history live on the
 thread.
 """
+import asyncio
 import hashlib
 import hmac
 import html
@@ -18,6 +19,7 @@ from pathlib import Path
 from typing import Literal, Optional
 
 import agora_db
+import sweep
 from agora_db import ph, retry_on_db_error
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
@@ -168,10 +170,19 @@ async def startup() -> None:
     pool = await agora_db.create_pool(DATABASE_URL, min_size=1, max_size=int(os.environ.get("DATABASE_POOL_MAX", "4")))
     async with pool.acquire() as conn:
         await agora_db.apply_schema(conn, SCHEMA_PATH)
+    global _sweep_task
+    if sweep.enabled():
+        _sweep_task = asyncio.create_task(sweep.loop(pool))
+        log.info("stale-thread sweep scheduler on (every %s)", sweep.interval())
+
+
+_sweep_task = None
 
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
+    if _sweep_task:
+        _sweep_task.cancel()
     if pool:
         await pool.close()
 
@@ -698,6 +709,27 @@ async def clear_attention_batch(req: MessageIdsRequest, request: Request):
                     _now(), *open_ids,
                 )
     return {"ok": True, "cleared": open_ids, "not_open": [i for i in ids if i not in set(open_ids)]}
+
+
+@app.get("/sweep")
+@retry_on_db_error
+async def sweep_status(preview: bool = False):
+    """The weekly stale-thread sweep: when it last ran and what it did.
+    `preview=true` also lists what a run would do right now (read-only)."""
+    out = {"enabled": sweep.enabled(), "sender": sweep.sweep_sender(), "interval_hours": sweep.interval().total_seconds() / 3600,
+           **await sweep.last_run(pool)}
+    if preview:
+        out["would_do"] = await sweep.preview(pool)
+    return out
+
+
+@app.post("/sweep/run")
+@retry_on_db_error
+async def sweep_run(request: Request):
+    """Run the sweep now, outside the schedule (operator only: it posts and
+    archives). Does not move the schedule."""
+    _check_operator_token(request, "running the stale-thread sweep")
+    return await sweep.run_sweep(pool)
 
 
 @app.get("/attention")
