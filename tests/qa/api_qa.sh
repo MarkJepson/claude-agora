@@ -211,6 +211,26 @@ BT=$(post /groups/$G/threads '{"topic":"QA batch archive (auto-deleted with grou
 eq "archive-batch"              "$(post /threads/archive-batch "{\"thread_ids\":[$BT,99999999]}" | jq -c '[.archived,.not_found]')" "[[$BT],[99999999]]"
 eq "archive-batch took effect"  "$(code -X POST "$A/threads/$BT/messages" -H 'Content-Type: application/json' -d '{"sender_role":"coordinator-claude","body":"x"}')" 409
 
+echo "== stale-thread sweep"
+# Needs the API started with SWEEP_SENDER_ROLE=$ME: the sweep acts on EVERY active thread, so it
+# only runs here when the sender is the throwaway role (never against a real relay's roles).
+if [ "$(curl -s $A/sweep | jq -r .sender)" = "$ME" ]; then
+  TS=$(post /groups/$G/threads '{"topic":"QA sweep thread (auto-deleted with group)"}' | jq -r .thread_id)
+  post /threads/$TS/messages "{\"sender_role\":\"$ME\",\"body\":\"sweep QA\"}" >/dev/null
+  db "UPDATE messages SET created_at = UTC_TIMESTAMP(6) - INTERVAL 9 DAY WHERE thread_id=$TS" >/dev/null
+  eq "preview: stale thread is prompted" "$(curl -s "$A/sweep?preview=true" | jq -c "[.would_do[] | select(.thread_id==$TS) | .action]")" '["prompt"]'
+  eq "run needs operator token"  "$(curl -s -o /dev/null -w '%{http_code}' -X POST $A/sweep/run -H 'X-Relay-Client: qa')" "$([ -n "$OPERATOR_TOKEN" ] && echo 403 || echo 200)"
+  post /sweep/run '{}' | jq -e ".prompted | index($TS)" >/dev/null && ok "run posts the check" || bad "run posts the check" "not prompted"
+  eq "check body"                "$(db "SELECT LEFT(body,18) FROM messages WHERE thread_id=$TS ORDER BY message_id DESC LIMIT 1")" "Stale-thread check"
+  eq "no second prompt"          "$(curl -s "$A/sweep?preview=true" | jq -c "[.would_do[] | select(.thread_id==$TS)]")" '[]'
+  db "UPDATE messages SET created_at = UTC_TIMESTAMP(6) - INTERVAL 8 DAY WHERE thread_id=$TS AND body LIKE 'Stale-thread check%'" >/dev/null
+  eq "preview: unanswered check archives" "$(curl -s "$A/sweep?preview=true" | jq -c "[.would_do[] | select(.thread_id==$TS) | .action]")" '["archive"]'
+  post /sweep/run '{}' >/dev/null
+  eq "thread archived"           "$(db "SELECT status FROM threads WHERE thread_id=$TS")" archived
+else
+  echo "SKIP  sweep (start the API with SWEEP_SENDER_ROLE=$ME to run these)"
+fi
+
 echo "== dashboard state"
 S=$(curl -s $A/api/dashboard/state)
 eq "state keys"                "$(echo "$S" | jq -c 'keys')" '["attention","deliveries","groups","message_counts","messages","roles","server_time","threads"]'

@@ -103,6 +103,14 @@ CREATE TABLE IF NOT EXISTS deliveries (
     FOREIGN KEY (recipient_role) REFERENCES roles(role)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_nopad_bin;
 
+-- Scheduled jobs run by the API itself (the weekly stale-thread sweep). A
+-- run claims its interval by updating last_run_at, so only one replica runs it.
+CREATE TABLE IF NOT EXISTS job_runs (
+    job         VARCHAR(100) NOT NULL PRIMARY KEY,
+    last_run_at DATETIME(6) NULL,
+    last_result TEXT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_nopad_bin;
+
 -- MariaDB has no partial indexes; (attn_kind, message_id) serves the
 -- "attn_kind IS NOT NULL" scans the same way.
 CREATE INDEX IF NOT EXISTS messages_attn_idx ON messages (attn_kind, message_id);

@@ -30,6 +30,10 @@ services:
       # rollout, warning logged at startup).
       OPERATOR_TOKEN: ${OPERATOR_TOKEN:-}
       RELAY_ALLOWED_HOSTS: ${RELAY_ALLOWED_HOSTS:-127.0.0.1:8089,localhost:8089}
+      # Weekly stale-thread sweep (off unless SWEEP_ENABLED=true). The QA suite
+      # sets SWEEP_SENDER_ROLE=coordinator-claude.
+      SWEEP_ENABLED: ${SWEEP_ENABLED:-}
+      SWEEP_SENDER_ROLE: ${SWEEP_SENDER_ROLE:-scrum-claude}
     ports:
       - "127.0.0.1:8089:8000"
     restart: unless-stopped

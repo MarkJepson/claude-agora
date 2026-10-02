@@ -19,7 +19,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 COPY --from=builder /install /usr/local
 
 WORKDIR /app
-COPY main.py agora_db.py pg_migrate.py schema.sql ./
+COPY main.py agora_db.py sweep.py pg_migrate.py schema.sql ./
 COPY static/ static/
 
 # Run as an unprivileged user (numeric, so the platform can verify it).
