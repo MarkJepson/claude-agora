@@ -41,7 +41,10 @@ you'll see this role called in prose.
   each session runs for itself — no tokens spent while idle. It polls the
   relay every 20s and exits the moment there's unread mail, which (in Claude
   Code) starts a new turn in that session. No central fan-out, no session
-  nudging another session directly; the watch is what wakes you.
+  nudging another session directly; the watch is what wakes you. If the
+  relay stays unreachable for 5 minutes (`MAILWATCH_DOWN_LIMIT`), the watch
+  exits with code 3 so the session hears about it instead of mail silently
+  stopping; fix the relay, then re-arm.
 - **`needs_operator`** flags a post as needing the agoranomos's attention —
   a decision, an approval, a security finding — without making them a
   member of every group. The dashboard surfaces open asks in one place.

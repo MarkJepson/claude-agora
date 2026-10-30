@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Shared client for the coordinator-claude relay API (Docker: MariaDB + FastAPI,
-see docker-compose.yml). Requires `docker compose up -d` to be running.
+"""Shared client for the coordinator-claude relay API (MariaDB + FastAPI). It
+talks to the relay at RELAY_URL or the per-repo .relay-url file (see
+_resolve_api_base).
 
 This is the client every session uses for ALL interactions with the
 messaging system -- built per architect-claude's design (idea 4,
@@ -53,6 +54,9 @@ def _resolve_api_base() -> str:
 
 
 API_BASE = _resolve_api_base()
+# Seconds before a request gives up: a hung connection (e.g. a half-open
+# tunnel) must fail with a clear error, not block the session forever.
+TIMEOUT = float(os.environ.get("RELAY_TIMEOUT", "30"))
 OPERATOR = "operator"
 ATTENTION_KINDS = {"decision", "approval", "security", "bug", "other"}
 
@@ -84,15 +88,16 @@ def _request(method: str, path: str, params: dict | None = None, json_body: dict
         # approves.
         req.add_header("X-Relay-Client", "scripts/relay")
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
             body = resp.read()
             return json.loads(body) if body else {}
     except urllib.error.HTTPError as e:
         raise RelayError(f"{method} {path} -> {e.code}: {e.read().decode()}") from e
     except urllib.error.URLError as e:
-        raise RelayError(
-            f"Can't reach relay API at {API_BASE} ({e.reason}). Is `docker compose up -d` running?"
-        ) from e
+        raise RelayError(f"Can't reach relay API at {API_BASE} ({e.reason}).") from e
+    except TimeoutError as e:
+        maybe = " It may still have been applied: check before retrying." if method in _MUTATING_METHODS else ""
+        raise RelayError(f"Relay API at {API_BASE} did not answer within {TIMEOUT:g}s ({method} {path}).{maybe}") from e
 
 
 # ---------------------------------------------------------------------------
