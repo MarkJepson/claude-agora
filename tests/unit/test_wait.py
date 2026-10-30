@@ -144,8 +144,8 @@ class Wait(unittest.TestCase):
         self.assertEqual(main._waiters, {})
 
     def test_many_waits_for_one_role_are_allowed_and_all_woken(self):
-        # No per-role limit: killed watches' leftover waits must not lock out
-        # a re-armed one, and a post wakes every wait for the role.
+        # A loose per-role limit (WAIT_MAX_PER_ROLE): killed watches' leftover
+        # waits must not lock out a re-armed one, and a post wakes them all.
         pool = FakePool()
 
         async def scenario():

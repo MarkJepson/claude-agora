@@ -49,6 +49,9 @@ class Pool:
     async def acquire(self):
         yield Conn()
 
+    async def close(self):   # the app's shutdown hook calls it
+        pass
+
 
 @unittest.skipIf(uvicorn is None, "uvicorn not installed (install api/requirements.txt)")
 class Stack(unittest.TestCase):
@@ -63,7 +66,8 @@ class Stack(unittest.TestCase):
         # Patched directly: the env var is read when main is first imported.
         main._ALLOWED_HOSTS.add(f"127.0.0.1:{cls.port}")
         cls.server = uvicorn.Server(uvicorn.Config(main.app, log_level="warning"))
-        threading.Thread(target=cls.server.run, kwargs={"sockets": [sock]}, daemon=True).start()
+        cls.thread = threading.Thread(target=cls.server.run, kwargs={"sockets": [sock]}, daemon=True)
+        cls.thread.start()
         for _ in range(100):
             if cls.server.started:
                 break
@@ -79,6 +83,7 @@ class Stack(unittest.TestCase):
                 break
             time.sleep(0.05)
         cls.server.should_exit = True
+        cls.thread.join(10)   # its shutdown hooks run against the fake state, then we restore
         main.pool, startup, hosts = cls.saved
         main.app.router.on_startup[:] = startup
         main._ALLOWED_HOSTS.clear()
@@ -100,8 +105,8 @@ class Stack(unittest.TestCase):
             t.start()
         for t in threads:
             t.join()
-        # The killed watches' waits are still open (the server can't tell).
-        self.assertEqual(len(main._waiters.get("r", ())), 6)
+        # Whether or not the server notices the hang-ups, a new wait must get
+        # in at once (today it doesn't notice: they stay open until timeout).
         t = time.monotonic()
         req = urllib.request.Request(
             f"http://127.0.0.1:{self.port}/roles/r/wait?timeout=1", data=b'{"known": []}', method="POST",
