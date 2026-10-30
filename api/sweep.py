@@ -36,6 +36,9 @@ CHECK_PREFIX = "Stale-thread check"
 ESCALATION_PREFIX = "Stale-thread escalation"
 STALE_DAYS = 7
 STILL_OPEN_DAYS = 28
+# Called with a post's recipient roles once it has committed; main.py sets it
+# to wake their waiting mail watches.
+notify = lambda roles: None  # noqa: E731
 SECURITY_WORDS = ("security finding", "vulnerab", "exposure")
 
 
@@ -127,17 +130,18 @@ def _body(step: dict) -> tuple[str, tuple[str, str] | None]:
     )
 
 
-async def _post(conn: agora_db.Conn, thread_id: int, sender: str, body: str, attn) -> bool:
+async def _post(conn: agora_db.Conn, thread_id: int, sender: str, body: str, attn) -> list[str]:
+    """Post into the thread; returns the group's members (empty: nothing posted)."""
     row = await conn.fetchrow("SELECT group_id, status FROM threads WHERE thread_id = $1", thread_id)
     if row is None or row["status"] != "active":
-        return False
+        return []
     members = [
         r["role"] for r in await conn.fetch(
             "SELECT role FROM group_members WHERE group_id = $1 AND left_at IS NULL", row["group_id"],
         )
     ]
     if not members:
-        return False
+        return []
     message_id = await conn.insert(
         "INSERT INTO messages (thread_id, sender_role, body, attn_kind, attn_why) VALUES ($1, $2, $3, $4, $5)",
         thread_id, sender, body, attn[0] if attn else None, attn[1] if attn else None,
@@ -147,7 +151,7 @@ async def _post(conn: agora_db.Conn, thread_id: int, sender: str, body: str, att
             "INSERT INTO deliveries (message_id, recipient_role, delivered_at) VALUES ($1, $2, NULL)",
             message_id, role,
         )
-    return True
+    return members
 
 
 async def apply(pool, steps: list[dict], sender: str) -> dict:
@@ -158,6 +162,7 @@ async def apply(pool, steps: list[dict], sender: str) -> dict:
             raise RuntimeError(f"sweep sender role {sender!r} is not registered")
         for s in steps:
             tid = s["thread_id"]
+            recipients = []
             async with conn.transaction():
                 if s["action"] == "archive":
                     n = await conn.execute(
@@ -166,7 +171,9 @@ async def apply(pool, steps: list[dict], sender: str) -> dict:
                     ok = n > 0
                 else:
                     body, attn = _body(s)
-                    ok = await _post(conn, tid, sender, body, attn)
+                    recipients = await _post(conn, tid, sender, body, attn)
+                    ok = bool(recipients)
+            notify(recipients)
             key = {"prompt": "prompted", "archive": "archived", "escalate": "escalated"}[s["action"]]
             done[key if ok else "skipped"].append(tid)
     return done
