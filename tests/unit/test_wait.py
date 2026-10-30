@@ -143,34 +143,41 @@ class Wait(unittest.TestCase):
         asyncio.run(self.wait(FakePool([row(5)])))
         self.assertEqual(main._waiters, {})
 
-    def test_a_new_wait_beyond_the_limit_supersedes_the_oldest(self):
-        # Newest wins: a killed watch's orphaned wait must not lock out its
-        # re-armed successor.
+    def test_many_waits_for_one_role_are_allowed_and_all_woken(self):
+        # No per-role limit: killed watches' leftover waits must not lock out
+        # a re-armed one, and a post wakes every wait for the role.
         pool = FakePool()
 
         async def scenario():
-            old = []
-            for _ in range(main.WAIT_MAX_PER_ROLE):
-                old.append(asyncio.create_task(self.wait(pool, timeout=10)))
-                await asyncio.sleep(0.02)
-            t = time.monotonic()
-            new = asyncio.create_task(self.wait(pool, timeout=1))
-            first = await asyncio.wait_for(old[0], 1)
-            elapsed = time.monotonic() - t
-            main._notify(["r"])   # nothing new: the rest keep waiting
+            waits = [asyncio.create_task(self.wait(pool, timeout=10)) for _ in range(10)]
             await asyncio.sleep(0.1)
-            still_waiting = [not t.done() for t in old[1:]]
-            out_new = await new
-            for t in old[1:]:
-                t.cancel()
-            return first, elapsed, still_waiting, out_new
+            pool.rows.append(row(7))
+            main._notify(["r"])
+            return await asyncio.wait_for(asyncio.gather(*waits), 2)
 
-        first, elapsed, still_waiting, out_new = asyncio.run(scenario())
-        self.assertTrue(first["superseded"])
-        self.assertEqual(first["pending"], [])
-        self.assertLess(elapsed, 0.5)
-        self.assertEqual(still_waiting, [True] * (main.WAIT_MAX_PER_ROLE - 1))
-        self.assertFalse(out_new["superseded"])
+        outs = asyncio.run(scenario())
+        self.assertEqual([[m["message_id"] for m in o["pending"]] for o in outs], [[7]] * 10)
+        self.assertEqual(main._waiters, {})
+
+    def test_over_the_global_safety_cap_is_503(self):
+        saved = main.WAIT_MAX_TOTAL
+        main.WAIT_MAX_TOTAL = 2
+        pool = FakePool()
+
+        async def scenario():
+            waits = [asyncio.create_task(self.wait(pool, timeout=1)) for _ in range(2)]
+            await asyncio.sleep(0.1)
+            try:
+                await self.wait(pool, timeout=1)
+            finally:
+                await asyncio.gather(*waits)
+
+        try:
+            with self.assertRaises(HTTPException) as cm:
+                asyncio.run(scenario())
+            self.assertEqual(cm.exception.status_code, 503)
+        finally:
+            main.WAIT_MAX_TOTAL = saved
 
     def test_queries_ids_not_bodies(self):
         pool = FakePool([row(5)])

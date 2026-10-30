@@ -1,7 +1,7 @@
 """POST /roles/{role}/wait through the REAL app stack (uvicorn, the CSRF
 middleware, Starlette). The server can't see a client hang up behind the
-middleware, so killed watches' waits stay open; a re-armed watch must still
-get a wait (newest wins), not be refused. Needs uvicorn (in the
+middleware, so killed watches' waits stay open until their timeout; a
+re-armed watch must still get a wait straight away. Needs uvicorn (in the
 API's requirements); no database (a fake pool). Run from the repo root:
 
     python3 tests/unit/test_wait_stack.py
@@ -23,12 +23,9 @@ for _d in [p / "api" for p in _here.parents] + [Path("/app")]:
         sys.path.insert(0, str(_d))
         break
 os.environ.setdefault("DATABASE_URL", "mysql://unused@localhost/unused")
-os.environ["RELAY_ALLOWED_HOSTS"] = "127.0.0.1:18980"
 import uvicorn  # noqa: E402
 
 import main  # noqa: E402
-
-PORT = 18980
 
 
 class Conn:
@@ -48,52 +45,59 @@ class Pool:
         yield Conn()
 
 
-def wait_request(timeout=25):
-    req = urllib.request.Request(
-        f"http://127.0.0.1:{PORT}/roles/r/wait?timeout={timeout}", data=b'{"known": []}', method="POST",
-        headers={"X-Relay-Client": "test", "Content-Type": "application/json"},
-    )
-    return req
-
-
-def hang_up_after(seconds):
-    """Start a wait and drop the connection after `seconds` (a killed watch)."""
-    s = socket.create_connection(("127.0.0.1", PORT))
-    body = b'{"known": []}'
-    s.sendall(b"POST /roles/r/wait?timeout=25 HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nX-Relay-Client: test\r\n"
-              b"Content-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (PORT, len(body), body))
-    time.sleep(seconds)
-    s.close()
-
-
-class Disconnect(unittest.TestCase):
+class Stack(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        cls.saved = (main.pool, list(main.app.router.on_startup), set(main._ALLOWED_HOSTS))
         main.app.router.on_startup.clear()
         main.pool = Pool()
-        cls.server = uvicorn.Server(uvicorn.Config(main.app, host="127.0.0.1", port=PORT, log_level="warning"))
-        threading.Thread(target=cls.server.run, daemon=True).start()
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))   # a free port, whatever else is running
+        cls.port = sock.getsockname()[1]
+        # Patched directly: the env var is read when main is first imported.
+        main._ALLOWED_HOSTS.add(f"127.0.0.1:{cls.port}")
+        cls.server = uvicorn.Server(uvicorn.Config(main.app, log_level="warning"))
+        threading.Thread(target=cls.server.run, kwargs={"sockets": [sock]}, daemon=True).start()
         for _ in range(100):
             if cls.server.started:
                 break
             time.sleep(0.05)
+        else:
+            raise RuntimeError("test server did not start")
 
     @classmethod
     def tearDownClass(cls):
         cls.server.should_exit = True
+        main.pool, startup, hosts = cls.saved
+        main.app.router.on_startup[:] = startup
+        main._ALLOWED_HOSTS.clear()
+        main._ALLOWED_HOSTS.update(hosts)
+
+    def hang_up_after(self, seconds):
+        """Start a wait and drop the connection (a killed mail watch)."""
+        s = socket.create_connection(("127.0.0.1", self.port))
+        body = b'{"known": []}'
+        s.sendall(b"POST /roles/r/wait?timeout=25 HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nX-Relay-Client: test\r\n"
+                  b"Content-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (self.port, len(body), body))
+        time.sleep(seconds)
+        s.close()
 
     def test_a_rearmed_watch_gets_in_after_killed_ones(self):
-        threads = [threading.Thread(target=hang_up_after, args=(0.5,)) for _ in range(main.WAIT_MAX_PER_ROLE)]
+        threads = [threading.Thread(target=self.hang_up_after, args=(0.5,)) for _ in range(6)]
         for t in threads:
             t.start()
         for t in threads:
             t.join()
-        # Four killed watches' waits are still open and fill every slot.
-        self.assertEqual(len(main._waiters.get("r", [])), main.WAIT_MAX_PER_ROLE)
+        # The killed watches' waits are still open (the server can't tell).
+        self.assertEqual(len(main._waiters.get("r", ())), 6)
         t = time.monotonic()
-        with urllib.request.urlopen(wait_request(timeout=1), timeout=5) as resp:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/roles/r/wait?timeout=1", data=b'{"known": []}', method="POST",
+            headers={"X-Relay-Client": "test", "Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
             self.assertEqual(resp.status, 200)
-            self.assertFalse(json.loads(resp.read())["superseded"])
+            self.assertEqual(json.loads(resp.read()), {"pending": []})
         self.assertLess(time.monotonic() - t, 3)
 
 

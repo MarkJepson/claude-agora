@@ -903,29 +903,22 @@ async def _pending_ids(conn: agora_db.Conn, role: str):
 # The longest wait stays under a typical 30 s termination grace period, because
 # uvicorn lets open requests finish before it stops.
 #
-# A role may hold WAIT_MAX_PER_ROLE waits; a new one beyond that ends the
-# OLDEST with superseded=true (newest wins). The server can't see a client
-# hang up (the HTTP middleware hides the disconnect), so a killed watch's wait
-# would otherwise keep its slot until the timeout and lock its re-armed
-# successor out. A superseded watch polls once and pauses an interval, so
-# genuine duplicate watches still get mail and heartbeats without a tight loop.
+# There is no per-role limit on open waits, on purpose: the server can't see a
+# client hang up (the HTTP middleware hides the disconnect), so a killed
+# watch's wait stays open until its timeout, and a per-role limit would lock
+# the re-armed watch out. An orphaned wait is cheap (no DB connection held,
+# one query per wake-up) and ends within WAIT_TIMEOUT_MAX. WAIT_MAX_TOTAL is
+# only a safety net against a runaway client; it answers 503, which a watch
+# treats as "relay busy" and retries.
 WAIT_TIMEOUT_MAX = 25
-WAIT_MAX_PER_ROLE = 4
-
-
-class _Waiter:
-    def __init__(self):
-        self.ev = asyncio.Event()
-        self.superseded = False
-
-
-_waiters: dict[str, list[_Waiter]] = {}   # per role, oldest first
+WAIT_MAX_TOTAL = 200
+_waiters: dict[str, set[asyncio.Event]] = {}
 
 
 def _notify(roles) -> None:
     for role in roles:
-        for w in _waiters.get(role, ()):
-            w.ev.set()
+        for ev in _waiters.get(role, ()):
+            ev.set()
 
 
 @retry_on_db_error
@@ -952,46 +945,41 @@ class WaitRequest(BaseModel):
 @app.post("/roles/{role}/wait")
 async def wait_for_mail(role: str, req: WaitRequest, timeout: int = 25):
     """Long-poll form of GET /roles/{role}/pending?peek=true for mailwatch.sh.
-    Returns {"pending": [{message_id, thread_id, sender_role, delivered_at}],
-    "superseded": bool}: the role's unread mail minus `known` (no bodies) as
-    soon as there is any, or an empty list after `timeout` seconds (clamped
-    to WAIT_TIMEOUT_MAX), or early with superseded=true when a newer wait for
-    the role took this one's slot. Each call is also the watch's heartbeat,
-    with interval = timeout. POST, not GET, so the CSRF guard's
-    X-Relay-Client check applies (it writes the heartbeat). 404 if the role
-    has never been bound."""
+    Returns {"pending": [{message_id, thread_id, sender_role, delivered_at}]}:
+    the role's unread mail minus `known` (no bodies) as soon as there is any,
+    or an empty list after `timeout` seconds (clamped to WAIT_TIMEOUT_MAX).
+    Each call is also the watch's heartbeat, with interval = timeout. POST,
+    not GET, so the CSRF guard's X-Relay-Client check applies (it writes the
+    heartbeat). 404 if the role has never been bound; 503 if the relay
+    already holds WAIT_MAX_TOTAL waits."""
     if timeout < 1:
         raise HTTPException(422, "timeout must be at least 1 second")
     timeout = min(timeout, WAIT_TIMEOUT_MAX)
+    if sum(len(w) for w in _waiters.values()) >= WAIT_MAX_TOTAL:
+        raise HTTPException(503, f"relay already holds {WAIT_MAX_TOTAL} mail waits; retry shortly")
     known = set(req.known)
-    me = _Waiter()
-    waiting = _waiters.setdefault(role, [])
-    if len(waiting) >= WAIT_MAX_PER_ROLE:
-        oldest = waiting.pop(0)
-        oldest.superseded = True
-        oldest.ev.set()
+    ev = asyncio.Event()
+    waiting = _waiters.setdefault(role, set())
     # Registered BEFORE the first query: a post that commits between that
-    # query and the wait below has already set our event, so it is not missed.
-    waiting.append(me)
+    # query and the wait below has already set ev, so it is not missed.
+    waiting.add(ev)
     try:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         await _wait_heartbeat(role, timeout)
         while True:
-            me.ev.clear()
-            rows = [] if me.superseded else await _wait_query(role, known)
-            if rows or me.superseded or loop.time() >= deadline:
-                return {"pending": rows, "superseded": me.superseded}
+            ev.clear()
+            rows = await _wait_query(role, known)
+            if rows or loop.time() >= deadline:
+                return {"pending": rows}
             try:
-                await asyncio.wait_for(me.ev.wait(), deadline - loop.time())
+                await asyncio.wait_for(ev.wait(), deadline - loop.time())
             except asyncio.TimeoutError:
                 pass
     finally:
-        waiting = _waiters.get(role, [])
-        if me in waiting:
-            waiting.remove(me)
-        if not waiting:
-            _waiters.pop(role, None)
+        waiting.discard(ev)
+        if not waiting and _waiters.get(role) is waiting:
+            del _waiters[role]
 
 
 @app.get("/roles/{role}/pending")
