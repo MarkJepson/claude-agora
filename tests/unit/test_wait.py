@@ -159,6 +159,30 @@ class Wait(unittest.TestCase):
         self.assertEqual([[m["message_id"] for m in o["pending"]] for o in outs], [[7]] * 10)
         self.assertEqual(main._waiters, {})
 
+    def test_over_the_per_role_cap_is_503_for_that_role_only(self):
+        saved = main.WAIT_MAX_PER_ROLE
+        main.WAIT_MAX_PER_ROLE = 2
+        pool = FakePool()
+
+        async def scenario():
+            waits = [asyncio.create_task(self.wait(pool, timeout=1)) for _ in range(2)]
+            other = asyncio.create_task(main.wait_for_mail("s", main.WaitRequest(), timeout=1))
+            await asyncio.sleep(0.1)
+            try:
+                await self.wait(pool, timeout=1)
+                third = None
+            except HTTPException as e:
+                third = e.status_code
+            await asyncio.gather(*waits)
+            return third, await other   # another role is not affected
+
+        try:
+            third, other = asyncio.run(scenario())
+            self.assertEqual(third, 503)
+            self.assertEqual(other, {"pending": []})
+        finally:
+            main.WAIT_MAX_PER_ROLE = saved
+
     def test_over_the_global_safety_cap_is_503(self):
         saved = main.WAIT_MAX_TOTAL
         main.WAIT_MAX_TOTAL = 2

@@ -453,6 +453,10 @@ async def add_member(group_id: int, req: AddMemberRequest):
             exists = await conn.fetchval("SELECT 1 FROM `groups` WHERE group_id = $1", group_id)
             if not exists:
                 raise HTTPException(404, f"group {group_id} does not exist")
+            already = await conn.fetchval(
+                "SELECT 1 FROM group_members WHERE group_id = $1 AND role = $2 AND left_at IS NULL",
+                group_id, req.role,
+            )
             # ON DUPLICATE KEY covers both a genuine re-add (no-op, already a
             # member) and rejoining after having left (left_at is reset).
             await conn.execute(
@@ -460,7 +464,8 @@ async def add_member(group_id: int, req: AddMemberRequest):
                    ON DUPLICATE KEY UPDATE left_at = NULL""",
                 group_id, req.role,
             )
-    _notify([req.role])   # a rejoin can make old unread mail visible again
+    if not already:
+        _notify([req.role])   # joining can make unread mail visible to its wait
     return {"ok": True}
 
 
@@ -903,14 +908,15 @@ async def _pending_ids(conn: agora_db.Conn, role: str):
 # The longest wait stays under a typical 30 s termination grace period, because
 # uvicorn lets open requests finish before it stops.
 #
-# There is no per-role limit on open waits, on purpose: the server can't see a
-# client hang up (the HTTP middleware hides the disconnect), so a killed
-# watch's wait stays open until its timeout, and a per-role limit would lock
-# the re-armed watch out. An orphaned wait is cheap (no DB connection held,
-# one query per wake-up) and ends within WAIT_TIMEOUT_MAX. WAIT_MAX_TOTAL is
-# only a safety net against a runaway client; it answers 503, which a watch
-# treats as "relay busy" and retries.
+# The per-role limit is deliberately loose: the server can't see a client hang
+# up (the HTTP middleware hides the disconnect), so a killed watch's wait stays
+# open until its timeout, and a tight limit would lock the re-armed watch out.
+# An orphaned wait is cheap (no DB connection held, one query per wake-up) and
+# ends within WAIT_TIMEOUT_MAX. The limits only contain a runaway client: per
+# role, so one role can't starve the others, and in total. Both answer 503,
+# which a watch treats as "relay busy" and retries.
 WAIT_TIMEOUT_MAX = 25
+WAIT_MAX_PER_ROLE = 20
 WAIT_MAX_TOTAL = 200
 _waiters: dict[str, set[asyncio.Event]] = {}
 
@@ -950,11 +956,13 @@ async def wait_for_mail(role: str, req: WaitRequest, timeout: int = 25):
     or an empty list after `timeout` seconds (clamped to WAIT_TIMEOUT_MAX).
     Each call is also the watch's heartbeat, with interval = timeout. POST,
     not GET, so the CSRF guard's X-Relay-Client check applies (it writes the
-    heartbeat). 404 if the role has never been bound; 503 if the relay
-    already holds WAIT_MAX_TOTAL waits."""
+    heartbeat). 404 if the role has never been bound; 503 if the role
+    already has WAIT_MAX_PER_ROLE waits open or the relay WAIT_MAX_TOTAL."""
     if timeout < 1:
         raise HTTPException(422, "timeout must be at least 1 second")
     timeout = min(timeout, WAIT_TIMEOUT_MAX)
+    if len(_waiters.get(role, ())) >= WAIT_MAX_PER_ROLE:
+        raise HTTPException(503, f"{role} already has {WAIT_MAX_PER_ROLE} mail waits open; retry shortly")
     if sum(len(w) for w in _waiters.values()) >= WAIT_MAX_TOTAL:
         raise HTTPException(503, f"relay already holds {WAIT_MAX_TOTAL} mail waits; retry shortly")
     known = set(req.known)

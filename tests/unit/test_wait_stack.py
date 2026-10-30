@@ -23,9 +23,14 @@ for _d in [p / "api" for p in _here.parents] + [Path("/app")]:
         sys.path.insert(0, str(_d))
         break
 os.environ.setdefault("DATABASE_URL", "mysql://unused@localhost/unused")
-import uvicorn  # noqa: E402
+try:
+    import uvicorn  # noqa: E402
+except ImportError:   # only the API's requirements bring it
+    uvicorn = None
 
 import main  # noqa: E402
+
+HANG_UP_TIMEOUT = 2   # the killed watches' waits end this soon, so teardown can wait for them
 
 
 class Conn:
@@ -45,6 +50,7 @@ class Pool:
         yield Conn()
 
 
+@unittest.skipIf(uvicorn is None, "uvicorn not installed (install api/requirements.txt)")
 class Stack(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -67,6 +73,11 @@ class Stack(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        # Let the leftover waits finish before restoring what they use.
+        for _ in range(100):
+            if not main._waiters:
+                break
+            time.sleep(0.05)
         cls.server.should_exit = True
         main.pool, startup, hosts = cls.saved
         main.app.router.on_startup[:] = startup
@@ -77,8 +88,9 @@ class Stack(unittest.TestCase):
         """Start a wait and drop the connection (a killed mail watch)."""
         s = socket.create_connection(("127.0.0.1", self.port))
         body = b'{"known": []}'
-        s.sendall(b"POST /roles/r/wait?timeout=25 HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nX-Relay-Client: test\r\n"
-                  b"Content-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (self.port, len(body), body))
+        s.sendall(b"POST /roles/r/wait?timeout=%d HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nX-Relay-Client: test\r\n"
+                  b"Content-Type: application/json\r\nContent-Length: %d\r\n\r\n%s"
+                  % (HANG_UP_TIMEOUT, self.port, len(body), body))
         time.sleep(seconds)
         s.close()
 

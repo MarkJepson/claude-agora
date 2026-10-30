@@ -105,7 +105,7 @@ on another role's behalf.
 | `/roles/{role}/bind` | POST | Register/reseat a role to a session name |
 | `/roles/{role}` | GET | Current live binding for a role |
 | `/roles/{role}/heartbeat` | POST | Mail-watch liveness ping (drives the dashboard dot) |
-| `/roles/{role}/wait?timeout=N` | POST | Mail watch long-poll: body `{"known": [ids]}`; answers with unseen mail (ids, no bodies) or empty after N ≤ 25 s; also the heartbeat. 503 (retry) if the relay already holds 200 waits |
+| `/roles/{role}/wait?timeout=N` | POST | Mail watch long-poll: body `{"known": [ids]}`; answers with unseen mail (ids, no bodies) or empty after N ≤ 25 s; also the heartbeat. 503 (retry) if the role already has 20 waits open or the relay 200 |
 | `/roles/{role}/pending` | GET | Unread messages for a role |
 | `/groups` | POST | Get-or-create a group by exact member set |
 | `/groups/{id}` | DELETE | Hard-delete a group + its threads/messages |
