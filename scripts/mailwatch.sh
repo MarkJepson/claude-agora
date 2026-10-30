@@ -19,7 +19,10 @@
 # the id of your own post) costs at most one extra wake; it can't silence
 # mail you haven't been told about (security-claude, pilot msg 746).
 # Exits 2 with a message on bad input, an unknown role or a 4xx from the
-# relay. If the relay is unreachable or erroring (5xx), it keeps waiting.
+# relay. If the relay is unreachable or erroring (5xx) it keeps waiting, but
+# only for DOWN_LIMIT seconds (MAILWATCH_DOWN_LIMIT, default 300): then it
+# exits 3, so the session is woken and told, instead of mail silently
+# stopping. A session that gets exit 3 checks the relay, then re-arms.
 # Every loop it also posts a heartbeat (POST /roles/<role>/heartbeat), so
 # the dashboard shows the watch as running, or flags it once it stops.
 # Mail is checked with peek=true: the heartbeat is what marks the role seen.
@@ -42,6 +45,22 @@ die() { echo "mailwatch: $*" >&2; exit 2; }
 
 [[ $AFTER =~ ^[0-9]+$ ]] || die "after_id must be a number, got '$AFTER'"
 [[ $INTERVAL =~ ^[0-9]+$ ]] && [ "$INTERVAL" -ge 1 ] || die "interval must be a positive number, got '$INTERVAL'"
+DOWN_LIMIT=${MAILWATCH_DOWN_LIMIT:-300}
+[[ $DOWN_LIMIT =~ ^[0-9]+$ ]] || die "MAILWATCH_DOWN_LIMIT must be a number of seconds, got '$DOWN_LIMIT'"
+
+down_since=   # when the relay stopped answering (empty while it answers)
+# The relay didn't answer usefully (no connection, timeout, 5xx): wait one
+# interval, or give up with exit 3 once it has been down for DOWN_LIMIT.
+relay_down() {
+  local now; now=$(date +%s)
+  [ -z "$down_since" ] && down_since=$now
+  if [ $((now - down_since)) -ge "$DOWN_LIMIT" ]; then
+    echo "mailwatch: relay at $URL unreachable or erroring for $((now - down_since))s (last: HTTP $1)." >&2
+    echo "Check the relay (curl $URL/health), then re-arm: $0 $ROLE $AFTER" >&2
+    exit 3
+  fi
+  sleep "$INTERVAL"
+}
 
 checked_role=
 known=   # JSON array of delivered ids <= after_id left unread, set on first check
@@ -51,7 +70,7 @@ while :; do
     case $rc in
       200) checked_role=1 ;;
       404) die "role '$ROLE' has never been bound on the relay (typo?)" ;;
-      *) sleep "$INTERVAL"; continue ;;   # relay down: validate once it's back
+      *) relay_down "$rc"; continue ;;   # relay down: validate once it's back
     esac
   fi
   curl -s -o /dev/null -m 5 -X POST -H 'X-Relay-Client: mailwatch.sh' "$URL/roles/$ROLE/heartbeat?interval=$INTERVAL" || true
@@ -61,8 +80,9 @@ while :; do
   case $code in
     200) ;;
     4??) die "relay returned HTTP $code: $body" ;;
-    *) sleep "$INTERVAL"; continue ;;
+    *) relay_down "$code"; continue ;;
   esac
+  down_since=
   if [ -z "$known" ]; then
     known=$(printf '%s' "$body" | jq -c --argjson after "$AFTER" \
       '[.pending[] | select(.message_id <= $after and .delivered_at != null) | .message_id]') \

@@ -45,11 +45,14 @@ _PARAM = re.compile(r"\$(\d+)")
 
 # Errors after which the transaction is known to have rolled back, so re-running
 # the handler cannot double-apply it: 1213 deadlock, 1205 lock wait timeout,
-# 1047 server not ready. Lost
+# 1047 server not ready, 1020 "record has changed since last read" (a write
+# conflict under innodb_snapshot_isolation, seen on a busy replicated
+# database). Each is raised by a statement, before COMMIT, so the handler's
+# transaction() rolls it back. Lost
 # connections (2006/2013) are deliberately NOT retried: if the COMMIT had
 # already succeeded, a retry would post the message twice. Stale pooled
 # connections are handled before the handler runs (see Pool.acquire).
-_RETRYABLE_CODES = {1213, 1205, 1047}
+_RETRYABLE_CODES = {1213, 1205, 1047, 1020}
 # Startup DDL can also collide with another replica's DDL (1061 duplicate key name).
 _DDL_RETRYABLE = _RETRYABLE_CODES | {1061}
 
