@@ -283,16 +283,21 @@ async def heartbeat(role: str, interval: int = 20):
     if not 1 <= interval <= 3600:
         raise HTTPException(422, "interval must be 1..3600 seconds")
     async with pool.acquire() as conn:
-        bound = await conn.fetchval("SELECT 1 FROM role_bindings WHERE role = $1", role)
-        if not bound:
-            raise HTTPException(404, f"role {role} has never been bound")
-        now = _now()
-        await conn.execute(
-            """UPDATE roles SET heartbeat_at = $1, heartbeat_interval = $2, last_seen_at = $1
-               WHERE role = $3""",
-            now, interval, role,
-        )
+        await _record_heartbeat(conn, role, interval)
     return {"ok": True}
+
+
+async def _record_heartbeat(conn: agora_db.Conn, role: str, interval: int) -> None:
+    """The mail watch is alive: shared by /heartbeat (polling) and /wait."""
+    bound = await conn.fetchval("SELECT 1 FROM role_bindings WHERE role = $1", role)
+    if not bound:
+        raise HTTPException(404, f"role {role} has never been bound")
+    now = _now()
+    await conn.execute(
+        """UPDATE roles SET heartbeat_at = $1, heartbeat_interval = $2, last_seen_at = $1
+           WHERE role = $3""",
+        now, interval, role,
+    )
 
 
 @app.get("/roles/{role}")
@@ -455,6 +460,7 @@ async def add_member(group_id: int, req: AddMemberRequest):
                    ON DUPLICATE KEY UPDATE left_at = NULL""",
                 group_id, req.role,
             )
+    _notify([req.role])   # a rejoin can make old unread mail visible again
     return {"ok": True}
 
 
@@ -855,11 +861,8 @@ async def ack_message(message_id: int, role: str):
     return {"ok": True}
 
 
-async def _pending_rows(conn: agora_db.Conn, role: str, after: int = 0):
-    """The role's unread mail, oldest first: shared by /pending and /wait."""
-    return await conn.fetch(
-        """SELECT d.message_id, th.group_id, th.thread_id, th.topic,
-                  m.sender_role, m.body, m.created_at, d.delivered_at
+# A role's unread mail, oldest first (after the SELECT list).
+_PENDING_FROM = """
            FROM deliveries d
            JOIN messages m ON m.message_id = d.message_id
            JOIN threads th ON th.thread_id = m.thread_id
@@ -868,8 +871,23 @@ async def _pending_rows(conn: agora_db.Conn, role: str, after: int = 0):
            WHERE d.recipient_role = $1 AND d.read_at IS NULL
                  AND d.recipient_role != m.sender_role
                  AND d.message_id > $2
-           ORDER BY d.message_id""",
+           ORDER BY d.message_id"""
+
+
+async def _pending_rows(conn: agora_db.Conn, role: str, after: int = 0):
+    """The role's unread mail with bodies, for /pending."""
+    return await conn.fetch(
+        """SELECT d.message_id, th.group_id, th.thread_id, th.topic,
+                  m.sender_role, m.body, m.created_at, d.delivered_at""" + _PENDING_FROM,
         role, after,
+    )
+
+
+async def _pending_ids(conn: agora_db.Conn, role: str):
+    """The same mail without bodies or topics: all a mail watch uses (/wait)."""
+    return await conn.fetch(
+        "SELECT d.message_id, th.thread_id, m.sender_role, d.delivered_at" + _PENDING_FROM,
+        role, 0,
     )
 
 
@@ -882,8 +900,12 @@ async def _pending_rows(conn: agora_db.Conn, role: str, after: int = 0):
 # Every wait still ends with a query, so a missed wake-up (e.g. a post made by
 # another replica, which this process never hears about) costs at most one
 # timeout, never lost mail. Instant wake-ups therefore need a single replica.
-WAIT_TIMEOUT_MAX = 60
+# The longest wait stays under a typical 30 s termination grace period, because
+# uvicorn lets open requests finish before it stops; a wait whose client has
+# gone checks for that every WAIT_DISCONNECT_CHECK seconds and gives up its slot.
+WAIT_TIMEOUT_MAX = 25
 WAIT_MAX_PER_ROLE = 4   # more than this is duplicate watches, not a real need
+WAIT_DISCONNECT_CHECK = 2.0
 _waiters: dict[str, set[asyncio.Event]] = {}
 
 
@@ -896,19 +918,22 @@ def _notify(roles) -> None:
 class WaitRequest(BaseModel):
     # Unread ids the watch already knows about and deliberately left unread:
     # they never end a wait (mailwatch.sh's "known" set).
-    known: list[int] = Field(default_factory=list, max_length=MAX_BATCH)
+    # Not MAX_BATCH: a role may leave many messages deliberately unread.
+    known: list[int] = Field(default_factory=list, max_length=10000)
 
 
+# No @retry_on_db_error: a re-run would restart the wait with a fresh deadline
+# and outlast the client's own timeout. A DB error is a 5xx; the watch retries.
 @app.post("/roles/{role}/wait")
-@retry_on_db_error
-async def wait_for_mail(role: str, req: WaitRequest, timeout: int = 25):
+async def wait_for_mail(role: str, req: WaitRequest, request: Request, timeout: int = 25):
     """Long-poll form of GET /roles/{role}/pending?peek=true for mailwatch.sh.
-    Returns {"pending": [...]} (same rows as /pending, minus `known`) as soon
-    as there is any, or an empty list after `timeout` seconds. Each call is
-    also the watch's heartbeat, with interval = timeout. POST, not GET, so the
-    CSRF guard's X-Relay-Client check applies (it writes the heartbeat). 404
-    if the role has never been bound; 429 if the role already has
-    WAIT_MAX_PER_ROLE waits open."""
+    Returns {"pending": [{message_id, thread_id, sender_role, delivered_at}]}
+    (the role's unread mail minus `known`; no bodies) as soon as there is any,
+    or an empty list after `timeout` seconds. Each call is also the watch's
+    heartbeat, with interval = timeout. POST, not GET, so the CSRF guard's
+    X-Relay-Client check applies (it writes the heartbeat). 404 if the role
+    has never been bound; 429 if the role already has WAIT_MAX_PER_ROLE waits
+    open (the watch backs off and retries)."""
     if not 1 <= timeout <= WAIT_TIMEOUT_MAX:
         raise HTTPException(422, f"timeout must be 1..{WAIT_TIMEOUT_MAX} seconds")
     waiting = _waiters.setdefault(role, set())
@@ -923,25 +948,21 @@ async def wait_for_mail(role: str, req: WaitRequest, timeout: int = 25):
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         async with pool.acquire() as conn:
-            if not await conn.fetchval("SELECT 1 FROM role_bindings WHERE role = $1", role):
-                raise HTTPException(404, f"role {role} has never been bound")
-            now = _now()
-            await conn.execute(
-                """UPDATE roles SET heartbeat_at = $1, heartbeat_interval = $2, last_seen_at = $1
-                   WHERE role = $3""",
-                now, timeout, role,
-            )
+            await _record_heartbeat(conn, role, timeout)
         while True:
             ev.clear()
             async with pool.acquire() as conn:
-                rows = [dict(r) for r in await _pending_rows(conn, role) if r["message_id"] not in known]
-            remaining = deadline - loop.time()
-            if rows or remaining <= 0:
+                rows = [dict(r) for r in await _pending_ids(conn, role) if r["message_id"] not in known]
+            if rows or loop.time() >= deadline:
                 return {"pending": rows}
-            try:
-                await asyncio.wait_for(ev.wait(), remaining)
-            except asyncio.TimeoutError:
-                pass
+            # Wait for a wake-up, checking now and then that the client is
+            # still there (a killed watch must not keep its slot to the end).
+            while not ev.is_set() and loop.time() < deadline:
+                try:
+                    await asyncio.wait_for(ev.wait(), min(WAIT_DISCONNECT_CHECK, deadline - loop.time()))
+                except asyncio.TimeoutError:
+                    if await request.is_disconnected():
+                        return {"pending": []}
     finally:
         waiting.discard(ev)
         if not waiting:

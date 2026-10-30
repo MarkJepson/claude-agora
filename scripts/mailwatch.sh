@@ -53,7 +53,7 @@ die() { echo "mailwatch: $*" >&2; exit 2; }
 DOWN_LIMIT=${MAILWATCH_DOWN_LIMIT:-300}
 [[ $DOWN_LIMIT =~ ^[0-9]+$ ]] || die "MAILWATCH_DOWN_LIMIT must be a number of seconds, got '$DOWN_LIMIT'"
 WAIT=${MAILWATCH_WAIT:-25}
-[[ $WAIT =~ ^[0-9]+$ ]] && [ "$WAIT" -le 60 ] || die "MAILWATCH_WAIT must be 0..60 seconds, got '$WAIT'"
+[[ $WAIT =~ ^[0-9]+$ ]] && [ "$WAIT" -le 25 ] || die "MAILWATCH_WAIT must be 0..25 seconds, got '$WAIT'"
 use_wait=$([ "$WAIT" -gt 0 ] && echo 1)
 
 down_since=   # when the relay stopped answering (empty while it answers)
@@ -64,7 +64,7 @@ relay_down() {
   [ -z "$down_since" ] && down_since=$now
   if [ $((now - down_since)) -ge "$DOWN_LIMIT" ]; then
     echo "mailwatch: relay at $URL unreachable or erroring for $((now - down_since))s (last: HTTP $1)." >&2
-    echo "Check the relay (relay pending), then re-arm: $0 $ROLE $AFTER" >&2
+    echo "Check the relay (relay pending; this watch used $URL), then re-arm: $0 $ROLE $AFTER" >&2
     exit 3
   fi
   sleep "$INTERVAL"
@@ -97,6 +97,7 @@ while :; do
     200) ;;
     404) if [ "$body" = '{"detail":"Not Found"}' ]; then use_wait=; continue; fi   # older relay: no /wait
          die "relay returned HTTP $code: $body" ;;
+    429) sleep "$INTERVAL"; continue ;;   # too many waits open (e.g. a killed watch's): they end within 25 s
     4??) die "relay returned HTTP $code: $body" ;;
     *) relay_down "$code"; continue ;;
   esac
