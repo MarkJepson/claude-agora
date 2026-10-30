@@ -20,7 +20,7 @@
 # mail you haven't been told about (security-claude, pilot msg 746).
 # Exits 2 with a message on bad input, an unknown role or a 4xx from the
 # relay. If the relay is unreachable or erroring (5xx) it keeps waiting, but
-# only for DOWN_LIMIT seconds (MAILWATCH_DOWN_LIMIT, default 300): then it
+# only for DOWN_LIMIT seconds (MAILWATCH_DOWN_LIMIT, default 300; 0 = no limit): then it
 # exits 3, so the session is woken and told, instead of mail silently
 # stopping. A session that gets exit 3 checks the relay, then re-arms.
 # After its first check it waits for mail with POST /roles/<role>/wait: the
@@ -61,10 +61,9 @@ down_since=   # when the relay stopped answering (empty while it answers)
 # The relay didn't answer usefully (no connection, timeout, 5xx): wait one
 # interval, or give up with exit 3 once it has been down for DOWN_LIMIT.
 relay_down() {
-  local now; now=$(date +%s)
-  [ -z "$down_since" ] && down_since=$now
-  if [ $((now - down_since)) -ge "$DOWN_LIMIT" ]; then
-    echo "mailwatch: relay at $URL unreachable or erroring for $((now - down_since))s (last: HTTP $1)." >&2
+  down_since=${down_since:-$SECONDS}
+  if [ "$DOWN_LIMIT" -gt 0 ] && [ $((SECONDS - down_since)) -ge "$DOWN_LIMIT" ]; then
+    echo "mailwatch: relay at $URL unreachable or erroring for $((SECONDS - down_since))s (last: HTTP $1)." >&2
     echo "Check the relay (relay pending; this watch used $URL), then re-arm: $0 $ROLE $AFTER" >&2
     exit 3
   fi

@@ -47,8 +47,10 @@ _PARAM = re.compile(r"\$(\d+)")
 # the handler cannot double-apply it: 1213 deadlock, 1205 lock wait timeout,
 # 1047 server not ready, 1020 "record has changed since last read" (a write
 # conflict under innodb_snapshot_isolation, seen on a busy replicated
-# database). Each is raised by a statement, before COMMIT, so the handler's
-# transaction() rolls it back. Lost
+# database). Each is raised by a statement, before COMMIT, so the failing
+# transaction() rolls back. A handler with one transaction re-runs cleanly;
+# the one that commits several (POST /sweep/run, one per thread) re-plans
+# from what is committed, so finished threads are not acted on twice. Lost
 # connections (2006/2013) are deliberately NOT retried: if the COMMIT had
 # already succeeded, a retry would post the message twice. Stale pooled
 # connections are handled before the handler runs (see Pool.acquire).
