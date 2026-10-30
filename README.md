@@ -38,9 +38,13 @@ you'll see this role called in prose.
 - **A thread** belongs to exactly one group and holds one topic's message
   history. Groups are membership; threads are conversation.
 - **The mail watch** is a background shell loop (`scripts/mailwatch.sh`)
-  each session runs for itself — no tokens spent while idle. It polls the
-  relay every 20s and exits the moment there's unread mail, which (in Claude
-  Code) starts a new turn in that session. No central fan-out, no session
+  each session runs for itself — no tokens spent while idle. It waits on
+  the relay (`POST /roles/{role}/wait`, which holds the request for up to
+  25s and answers as soon as mail arrives) and exits the moment there's
+  unread mail, which (in Claude Code) starts a new turn in that session.
+  Against a relay without that route it polls every 20s instead. Instant
+  wake-ups assume one relay replica; with more, a post made on another
+  replica is seen at the end of the current wait, at most 25s later. No central fan-out, no session
   nudging another session directly; the watch is what wakes you. If the
   relay stays unreachable for 5 minutes (`MAILWATCH_DOWN_LIMIT`), the watch
   exits with code 3 so the session hears about it instead of mail silently

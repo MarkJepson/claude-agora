@@ -171,6 +171,7 @@ async def startup() -> None:
     async with pool.acquire() as conn:
         await agora_db.apply_schema(conn, SCHEMA_PATH)
     global _sweep_task
+    sweep.notify = _notify
     if sweep.enabled():
         _sweep_task = asyncio.create_task(sweep.loop(pool))
         log.info("stale-thread sweep scheduler on (every %s)", sweep.interval())
@@ -578,6 +579,7 @@ async def log_message(thread_id: int, req: LogMessageRequest, request: Request):
                     message_id, role,
                 )
     recipients = [r for r in members if r != req.sender_role]
+    _notify(recipients)   # committed above: waiting mail watches can see it now
     return {"message_id": message_id, "group_id": group_id, "recipients": recipients}
 
 
@@ -853,6 +855,99 @@ async def ack_message(message_id: int, role: str):
     return {"ok": True}
 
 
+async def _pending_rows(conn: agora_db.Conn, role: str, after: int = 0):
+    """The role's unread mail, oldest first: shared by /pending and /wait."""
+    return await conn.fetch(
+        """SELECT d.message_id, th.group_id, th.thread_id, th.topic,
+                  m.sender_role, m.body, m.created_at, d.delivered_at
+           FROM deliveries d
+           JOIN messages m ON m.message_id = d.message_id
+           JOIN threads th ON th.thread_id = m.thread_id
+           JOIN group_members gm ON gm.group_id = th.group_id
+                AND gm.role = d.recipient_role AND gm.left_at IS NULL
+           WHERE d.recipient_role = $1 AND d.read_at IS NULL
+                 AND d.recipient_role != m.sender_role
+                 AND d.message_id > $2
+           ORDER BY d.message_id""",
+        role, after,
+    )
+
+
+# --- Mail wait (long-poll, 2026-10-30) ---
+# A mail watch asks once and the relay holds the request until there is mail
+# it hasn't seen, or the timeout. A post wakes the waiting watches of its
+# recipients in memory (_notify, after the commit), so mail arrives in about a
+# second instead of up to one poll interval. A waiting request holds NO
+# database connection: it queries once at the start and once per wake-up.
+# Every wait still ends with a query, so a missed wake-up (e.g. a post made by
+# another replica, which this process never hears about) costs at most one
+# timeout, never lost mail. Instant wake-ups therefore need a single replica.
+WAIT_TIMEOUT_MAX = 60
+WAIT_MAX_PER_ROLE = 4   # more than this is duplicate watches, not a real need
+_waiters: dict[str, set[asyncio.Event]] = {}
+
+
+def _notify(roles) -> None:
+    for role in roles:
+        for ev in _waiters.get(role, ()):
+            ev.set()
+
+
+class WaitRequest(BaseModel):
+    # Unread ids the watch already knows about and deliberately left unread:
+    # they never end a wait (mailwatch.sh's "known" set).
+    known: list[int] = Field(default_factory=list, max_length=MAX_BATCH)
+
+
+@app.post("/roles/{role}/wait")
+@retry_on_db_error
+async def wait_for_mail(role: str, req: WaitRequest, timeout: int = 25):
+    """Long-poll form of GET /roles/{role}/pending?peek=true for mailwatch.sh.
+    Returns {"pending": [...]} (same rows as /pending, minus `known`) as soon
+    as there is any, or an empty list after `timeout` seconds. Each call is
+    also the watch's heartbeat, with interval = timeout. POST, not GET, so the
+    CSRF guard's X-Relay-Client check applies (it writes the heartbeat). 404
+    if the role has never been bound; 429 if the role already has
+    WAIT_MAX_PER_ROLE waits open."""
+    if not 1 <= timeout <= WAIT_TIMEOUT_MAX:
+        raise HTTPException(422, f"timeout must be 1..{WAIT_TIMEOUT_MAX} seconds")
+    waiting = _waiters.setdefault(role, set())
+    if len(waiting) >= WAIT_MAX_PER_ROLE:
+        raise HTTPException(429, f"{role} already has {len(waiting)} mail waits open (duplicate mail watches?)")
+    known = set(req.known)
+    ev = asyncio.Event()
+    # Registered BEFORE the first query: a post that commits between that
+    # query and the wait below has already set ev, so it is not missed.
+    waiting.add(ev)
+    try:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        async with pool.acquire() as conn:
+            if not await conn.fetchval("SELECT 1 FROM role_bindings WHERE role = $1", role):
+                raise HTTPException(404, f"role {role} has never been bound")
+            now = _now()
+            await conn.execute(
+                """UPDATE roles SET heartbeat_at = $1, heartbeat_interval = $2, last_seen_at = $1
+                   WHERE role = $3""",
+                now, timeout, role,
+            )
+        while True:
+            ev.clear()
+            async with pool.acquire() as conn:
+                rows = [dict(r) for r in await _pending_rows(conn, role) if r["message_id"] not in known]
+            remaining = deadline - loop.time()
+            if rows or remaining <= 0:
+                return {"pending": rows}
+            try:
+                await asyncio.wait_for(ev.wait(), remaining)
+            except asyncio.TimeoutError:
+                pass
+    finally:
+        waiting.discard(ev)
+        if not waiting:
+            _waiters.pop(role, None)
+
+
 @app.get("/roles/{role}/pending")
 @retry_on_db_error
 async def pending_for_role(role: str, after: int = 0, peek: bool = False):
@@ -872,20 +967,7 @@ async def pending_for_role(role: str, after: int = 0, peek: bool = False):
     /messages/{id}/delivered-batch, which is coordinator-claude's own separate
     'did my live nudge transport succeed' bookkeeping."""
     async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """SELECT d.message_id, th.group_id, th.thread_id, th.topic,
-                      m.sender_role, m.body, m.created_at, d.delivered_at
-               FROM deliveries d
-               JOIN messages m ON m.message_id = d.message_id
-               JOIN threads th ON th.thread_id = m.thread_id
-               JOIN group_members gm ON gm.group_id = th.group_id
-                    AND gm.role = d.recipient_role AND gm.left_at IS NULL
-               WHERE d.recipient_role = $1 AND d.read_at IS NULL
-                     AND d.recipient_role != m.sender_role
-                     AND d.message_id > $2
-               ORDER BY d.message_id""",
-            role, after,
-        )
+        rows = await _pending_rows(conn, role, after)
         if not peek:
             await _touch(conn, role, f"checked mail ({len(rows)} unread)" if not after
                          else f"checked mail ({len(rows)} newer than #{after})")

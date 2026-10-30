@@ -23,9 +23,14 @@
 # only for DOWN_LIMIT seconds (MAILWATCH_DOWN_LIMIT, default 300): then it
 # exits 3, so the session is woken and told, instead of mail silently
 # stopping. A session that gets exit 3 checks the relay, then re-arms.
-# Every loop it also posts a heartbeat (POST /roles/<role>/heartbeat), so
-# the dashboard shows the watch as running, or flags it once it stops.
-# Mail is checked with peek=true: the heartbeat is what marks the role seen.
+# After its first check it waits for mail with POST /roles/<role>/wait: the
+# relay holds that request until there is mail the watch hasn't seen, or for
+# MAILWATCH_WAIT seconds (default 25), so mail wakes the session in about a
+# second. Each wait is also the watch's heartbeat. Against a relay without
+# /wait (404), or with MAILWATCH_WAIT=0, it polls instead: every interval it
+# posts a heartbeat (POST /roles/<role>/heartbeat) and checks
+# /pending?peek=true. Either way the dashboard shows the watch as running, or
+# flags it once it stops; the heartbeat is what marks the role seen.
 # When it wakes the session it marks those messages "delivered" for the
 # role (WhatsApp-style: it reached the session). It never marks anything
 # read; only the session does that, once it has actually read it.
@@ -47,6 +52,9 @@ die() { echo "mailwatch: $*" >&2; exit 2; }
 [[ $INTERVAL =~ ^[0-9]+$ ]] && [ "$INTERVAL" -ge 1 ] || die "interval must be a positive number, got '$INTERVAL'"
 DOWN_LIMIT=${MAILWATCH_DOWN_LIMIT:-300}
 [[ $DOWN_LIMIT =~ ^[0-9]+$ ]] || die "MAILWATCH_DOWN_LIMIT must be a number of seconds, got '$DOWN_LIMIT'"
+WAIT=${MAILWATCH_WAIT:-25}
+[[ $WAIT =~ ^[0-9]+$ ]] && [ "$WAIT" -le 60 ] || die "MAILWATCH_WAIT must be 0..60 seconds, got '$WAIT'"
+use_wait=$([ "$WAIT" -gt 0 ] && echo 1)
 
 down_since=   # when the relay stopped answering (empty while it answers)
 # The relay didn't answer usefully (no connection, timeout, 5xx): wait one
@@ -56,7 +64,7 @@ relay_down() {
   [ -z "$down_since" ] && down_since=$now
   if [ $((now - down_since)) -ge "$DOWN_LIMIT" ]; then
     echo "mailwatch: relay at $URL unreachable or erroring for $((now - down_since))s (last: HTTP $1)." >&2
-    echo "Check the relay (curl $URL/health), then re-arm: $0 $ROLE $AFTER" >&2
+    echo "Check the relay (relay pending), then re-arm: $0 $ROLE $AFTER" >&2
     exit 3
   fi
   sleep "$INTERVAL"
@@ -73,12 +81,22 @@ while :; do
       *) relay_down "$rc"; continue ;;   # relay down: validate once it's back
     esac
   fi
-  curl -s -o /dev/null -m 5 -X POST -H 'X-Relay-Client: mailwatch.sh' "$URL/roles/$ROLE/heartbeat?interval=$INTERVAL" || true
-  resp=$(curl -s -m 5 -w '\n%{http_code}' "$URL/roles/$ROLE/pending?peek=true") || resp=$'\n000'
+  if [ -n "$known" ] && [ -n "$use_wait" ]; then
+    # Long-poll: the relay answers when there is mail outside $known, or
+    # after $WAIT seconds with none. It records the heartbeat itself.
+    resp=$(curl -s -m $((WAIT + 15)) -w '\n%{http_code}' -X POST -H 'X-Relay-Client: mailwatch.sh' \
+      -H 'Content-Type: application/json' -d "{\"known\": $known}" \
+      "$URL/roles/$ROLE/wait?timeout=$WAIT") || resp=$'\n000'
+  else
+    curl -s -o /dev/null -m 5 -X POST -H 'X-Relay-Client: mailwatch.sh' "$URL/roles/$ROLE/heartbeat?interval=$INTERVAL" || true
+    resp=$(curl -s -m 5 -w '\n%{http_code}' "$URL/roles/$ROLE/pending?peek=true") || resp=$'\n000'
+  fi
   code=${resp##*$'\n'}
   body=${resp%$'\n'*}
   case $code in
     200) ;;
+    404) if [ "$body" = '{"detail":"Not Found"}' ]; then use_wait=; continue; fi   # older relay: no /wait
+         die "relay returned HTTP $code: $body" ;;
     4??) die "relay returned HTTP $code: $body" ;;
     *) relay_down "$code"; continue ;;
   esac
@@ -102,5 +120,5 @@ while :; do
     echo "  $0 $ROLE $next"
     exit 0
   fi
-  sleep "$INTERVAL"
+  [ -n "$use_wait" ] || sleep "$INTERVAL"   # a wait already waited
 done
