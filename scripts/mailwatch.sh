@@ -28,6 +28,7 @@
 # MAILWATCH_WAIT seconds (default 25), so mail wakes the session in about a
 # second. Each wait is also the watch's heartbeat. Against a relay without
 # /wait (404), or with MAILWATCH_WAIT=0, it polls instead: every interval it
+# (also for one round after a newer wait for the role superseded its own)
 # posts a heartbeat (POST /roles/<role>/heartbeat) and checks
 # /pending?peek=true. Either way the dashboard shows the watch as running, or
 # flags it once it stops; the heartbeat is what marks the role seen.
@@ -72,6 +73,9 @@ relay_down() {
 
 checked_role=
 known=   # JSON array of delivered ids <= after_id left unread, set on first check
+waited=       # this round was a /wait (it already waited; don't sleep)
+superseded=   # our last wait was superseded: poll this round instead
+pause=        # this poll round followed a supersede: sleep an interval after it
 while :; do
   if [ -z "$checked_role" ]; then
     rc=$(curl -s -o /dev/null -w '%{http_code}' -m 5 "$URL/roles/$ROLE") || rc=000
@@ -81,13 +85,17 @@ while :; do
       *) relay_down "$rc"; continue ;;   # relay down: validate once it's back
     esac
   fi
-  if [ -n "$known" ] && [ -n "$use_wait" ]; then
+  if [ -n "$known" ] && [ -n "$use_wait" ] && [ -z "$superseded" ]; then
     # Long-poll: the relay answers when there is mail outside $known, or
     # after $WAIT seconds with none. It records the heartbeat itself.
+    waited=1
     resp=$(curl -s -m $((WAIT + 15)) -w '\n%{http_code}' -X POST -H 'X-Relay-Client: mailwatch.sh' \
       -H 'Content-Type: application/json' -d "{\"known\": $known}" \
       "$URL/roles/$ROLE/wait?timeout=$WAIT") || resp=$'\n000'
   else
+    # Polling: an older relay, MAILWATCH_WAIT=0, the first check, or the
+    # round after a newer wait for this role superseded ours.
+    waited= pause=$superseded superseded=
     curl -s -o /dev/null -m 5 -X POST -H 'X-Relay-Client: mailwatch.sh' "$URL/roles/$ROLE/heartbeat?interval=$INTERVAL" || true
     resp=$(curl -s -m 5 -w '\n%{http_code}' "$URL/roles/$ROLE/pending?peek=true") || resp=$'\n000'
   fi
@@ -97,11 +105,16 @@ while :; do
     200) ;;
     404) if [ "$body" = '{"detail":"Not Found"}' ]; then use_wait=; continue; fi   # older relay: no /wait
          die "relay returned HTTP $code: $body" ;;
-    429) sleep "$INTERVAL"; continue ;;   # too many waits open (e.g. a killed watch's): they end within 25 s
     4??) die "relay returned HTTP $code: $body" ;;
     *) relay_down "$code"; continue ;;
   esac
   down_since=
+  # A newer wait for this role took our slot (newest wins: usually a killed
+  # watch's leftover wait, here it's ours). Poll once, then pause an interval.
+  if [ -n "$waited" ] && [ "$(printf '%s' "$body" | jq -r '.superseded // false')" = true ]; then
+    superseded=1
+    continue
+  fi
   if [ -z "$known" ]; then
     known=$(printf '%s' "$body" | jq -c --argjson after "$AFTER" \
       '[.pending[] | select(.message_id <= $after and .delivered_at != null) | .message_id]') \
@@ -121,5 +134,7 @@ while :; do
     echo "  $0 $ROLE $next"
     exit 0
   fi
-  [ -n "$use_wait" ] || sleep "$INTERVAL"   # a wait already waited
+  # A wait already waited, and in wait mode the first check goes straight to
+  # waiting; sleep only when polling, or for the round after a supersede.
+  if [ -z "$waited" ] && { [ -z "$use_wait" ] || [ -n "$pause" ]; }; then sleep "$INTERVAL"; fi
 done

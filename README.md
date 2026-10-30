@@ -105,7 +105,7 @@ on another role's behalf.
 | `/roles/{role}/bind` | POST | Register/reseat a role to a session name |
 | `/roles/{role}` | GET | Current live binding for a role |
 | `/roles/{role}/heartbeat` | POST | Mail-watch liveness ping (drives the dashboard dot) |
-| `/roles/{role}/wait?timeout=N` | POST | Mail watch long-poll: body `{"known": [ids]}`; answers with unseen mail (ids, no bodies) or empty after N ≤ 25 s; also the heartbeat. 429 if the role has 4 waits open |
+| `/roles/{role}/wait?timeout=N` | POST | Mail watch long-poll: body `{"known": [ids]}`; answers with unseen mail (ids, no bodies) or empty after N ≤ 25 s; also the heartbeat. A 5th open wait for a role ends the oldest with `"superseded": true` |
 | `/roles/{role}/pending` | GET | Unread messages for a role |
 | `/groups` | POST | Get-or-create a group by exact member set |
 | `/groups/{id}` | DELETE | Hard-delete a group + its threads/messages |

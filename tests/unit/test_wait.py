@@ -62,24 +62,13 @@ class FakePool:
         yield FakeConn(self)
 
 
-class FakeRequest:
-    def __init__(self, gone_after=None):
-        self.start = time.monotonic()
-        self.gone_after = gone_after
-
-    async def is_disconnected(self):
-        return self.gone_after is not None and time.monotonic() - self.start >= self.gone_after
-
-
 class Wait(unittest.TestCase):
     def setUp(self):
         main._waiters.clear()
-        main.WAIT_DISCONNECT_CHECK = 0.1
 
-    def wait(self, pool, known=(), timeout=1, request=None):
+    def wait(self, pool, known=(), timeout=1):
         main.pool = pool
-        return main.wait_for_mail("r", main.WaitRequest(known=list(known)), request or FakeRequest(),
-                                  timeout=timeout)
+        return main.wait_for_mail("r", main.WaitRequest(known=list(known)), timeout=timeout)
 
     def test_returns_at_once_when_there_is_unseen_mail(self):
         pool = FakePool([row(5)])
@@ -154,29 +143,34 @@ class Wait(unittest.TestCase):
         asyncio.run(self.wait(FakePool([row(5)])))
         self.assertEqual(main._waiters, {})
 
-    def test_too_many_waits_for_one_role_is_429(self):
+    def test_a_new_wait_beyond_the_limit_supersedes_the_oldest(self):
+        # Newest wins: a killed watch's orphaned wait must not lock out its
+        # re-armed successor.
         pool = FakePool()
 
         async def scenario():
-            waits = [asyncio.create_task(self.wait(pool, timeout=1)) for _ in range(main.WAIT_MAX_PER_ROLE)]
+            old = []
+            for _ in range(main.WAIT_MAX_PER_ROLE):
+                old.append(asyncio.create_task(self.wait(pool, timeout=10)))
+                await asyncio.sleep(0.02)
+            t = time.monotonic()
+            new = asyncio.create_task(self.wait(pool, timeout=1))
+            first = await asyncio.wait_for(old[0], 1)
+            elapsed = time.monotonic() - t
+            main._notify(["r"])   # nothing new: the rest keep waiting
             await asyncio.sleep(0.1)
-            try:
-                await self.wait(pool, timeout=1)
-            finally:
-                await asyncio.gather(*waits)
+            still_waiting = [not t.done() for t in old[1:]]
+            out_new = await new
+            for t in old[1:]:
+                t.cancel()
+            return first, elapsed, still_waiting, out_new
 
-        with self.assertRaises(HTTPException) as cm:
-            asyncio.run(scenario())
-        self.assertEqual(cm.exception.status_code, 429)
-
-    def test_a_disconnected_client_gives_up_its_slot(self):
-        # A killed watch must not hold one of the role's WAIT_MAX_PER_ROLE
-        # slots until the timeout.
-        t = time.monotonic()
-        out = asyncio.run(self.wait(FakePool(), timeout=10, request=FakeRequest(gone_after=0.3)))
-        self.assertEqual(out["pending"], [])
-        self.assertLess(time.monotonic() - t, 1)
-        self.assertEqual(main._waiters, {})
+        first, elapsed, still_waiting, out_new = asyncio.run(scenario())
+        self.assertTrue(first["superseded"])
+        self.assertEqual(first["pending"], [])
+        self.assertLess(elapsed, 0.5)
+        self.assertEqual(still_waiting, [True] * (main.WAIT_MAX_PER_ROLE - 1))
+        self.assertFalse(out_new["superseded"])
 
     def test_queries_ids_not_bodies(self):
         pool = FakePool([row(5)])
@@ -188,11 +182,15 @@ class Wait(unittest.TestCase):
     def test_more_than_500_known_ids_are_accepted(self):
         main.WaitRequest(known=list(range(2000)))
 
-    def test_timeout_out_of_range_is_422(self):
-        for bad in (0, main.WAIT_TIMEOUT_MAX + 1):
-            with self.assertRaises(HTTPException) as cm:
-                asyncio.run(self.wait(FakePool(), timeout=bad))
-            self.assertEqual(cm.exception.status_code, 422)
+    def test_zero_timeout_is_422(self):
+        with self.assertRaises(HTTPException) as cm:
+            asyncio.run(self.wait(FakePool(), timeout=0))
+        self.assertEqual(cm.exception.status_code, 422)
+
+    def test_a_long_timeout_is_clamped_not_refused(self):
+        pool = FakePool([row(5)])
+        asyncio.run(self.wait(pool, timeout=main.WAIT_TIMEOUT_MAX + 30))
+        self.assertEqual(pool.heartbeats[0][1], main.WAIT_TIMEOUT_MAX)
 
 
 if __name__ == "__main__":
