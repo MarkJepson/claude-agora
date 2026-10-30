@@ -40,6 +40,7 @@ class FakeConn:
         return 1
 
     async def fetch(self, sql, *args):
+        self.pool.sql.append(sql)
         self.pool.pending_queries += 1
         out = list(self.pool.rows)
         if self.pool.on_query:
@@ -53,6 +54,7 @@ class FakePool:
         self.bound = bound
         self.on_query = on_query
         self.heartbeats = []
+        self.sql = []
         self.pending_queries = 0
 
     @asynccontextmanager
@@ -141,26 +143,85 @@ class Wait(unittest.TestCase):
         asyncio.run(self.wait(FakePool([row(5)])))
         self.assertEqual(main._waiters, {})
 
-    def test_too_many_waits_for_one_role_is_429(self):
+    def test_many_waits_for_one_role_are_allowed_and_all_woken(self):
+        # A loose per-role limit (WAIT_MAX_PER_ROLE): killed watches' leftover
+        # waits must not lock out a re-armed one, and a post wakes them all.
         pool = FakePool()
 
         async def scenario():
-            waits = [asyncio.create_task(self.wait(pool, timeout=1)) for _ in range(main.WAIT_MAX_PER_ROLE)]
+            waits = [asyncio.create_task(self.wait(pool, timeout=10)) for _ in range(10)]
+            await asyncio.sleep(0.1)
+            pool.rows.append(row(7))
+            main._notify(["r"])
+            return await asyncio.wait_for(asyncio.gather(*waits), 2)
+
+        outs = asyncio.run(scenario())
+        self.assertEqual([[m["message_id"] for m in o["pending"]] for o in outs], [[7]] * 10)
+        self.assertEqual(main._waiters, {})
+
+    def test_over_the_per_role_cap_is_503_for_that_role_only(self):
+        saved = main.WAIT_MAX_PER_ROLE
+        main.WAIT_MAX_PER_ROLE = 2
+        pool = FakePool()
+
+        async def scenario():
+            waits = [asyncio.create_task(self.wait(pool, timeout=1)) for _ in range(2)]
+            other = asyncio.create_task(main.wait_for_mail("s", main.WaitRequest(), timeout=1))
+            await asyncio.sleep(0.1)
+            try:
+                await self.wait(pool, timeout=1)
+                third = None
+            except HTTPException as e:
+                third = e.status_code
+            await asyncio.gather(*waits)
+            return third, await other   # another role is not affected
+
+        try:
+            third, other = asyncio.run(scenario())
+            self.assertEqual(third, 503)
+            self.assertEqual(other, {"pending": []})
+        finally:
+            main.WAIT_MAX_PER_ROLE = saved
+
+    def test_over_the_global_safety_cap_is_503(self):
+        saved = main.WAIT_MAX_TOTAL
+        main.WAIT_MAX_TOTAL = 2
+        pool = FakePool()
+
+        async def scenario():
+            waits = [asyncio.create_task(self.wait(pool, timeout=1)) for _ in range(2)]
             await asyncio.sleep(0.1)
             try:
                 await self.wait(pool, timeout=1)
             finally:
                 await asyncio.gather(*waits)
 
-        with self.assertRaises(HTTPException) as cm:
-            asyncio.run(scenario())
-        self.assertEqual(cm.exception.status_code, 429)
-
-    def test_timeout_out_of_range_is_422(self):
-        for bad in (0, main.WAIT_TIMEOUT_MAX + 1):
+        try:
             with self.assertRaises(HTTPException) as cm:
-                asyncio.run(self.wait(FakePool(), timeout=bad))
-            self.assertEqual(cm.exception.status_code, 422)
+                asyncio.run(scenario())
+            self.assertEqual(cm.exception.status_code, 503)
+        finally:
+            main.WAIT_MAX_TOTAL = saved
+
+    def test_queries_ids_not_bodies(self):
+        pool = FakePool([row(5)])
+        asyncio.run(self.wait(pool))
+        self.assertTrue(pool.sql)
+        for sql in pool.sql:
+            self.assertNotIn("m.body", sql)
+
+    def test_more_than_500_known_ids_are_accepted(self):
+        main.WaitRequest(known=list(range(2000)))
+
+    def test_zero_timeout_is_422(self):
+        with self.assertRaises(HTTPException) as cm:
+            asyncio.run(self.wait(FakePool(), timeout=0))
+        self.assertEqual(cm.exception.status_code, 422)
+
+    def test_a_long_timeout_is_clamped_not_refused(self):
+        pool = FakePool([row(5)])
+        asyncio.run(self.wait(pool, timeout=main.WAIT_TIMEOUT_MAX + 30))
+        self.assertEqual(pool.heartbeats[0][1], main.WAIT_TIMEOUT_MAX)
 
 
 if __name__ == "__main__":

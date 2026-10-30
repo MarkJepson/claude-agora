@@ -27,6 +27,7 @@ on another role's behalf (e.g. coordinator-claude's arbitrator duties).
 import argparse
 import contextlib
 import datetime
+import http.client
 import io
 import json
 import os
@@ -54,9 +55,24 @@ def _resolve_api_base() -> str:
 
 
 API_BASE = _resolve_api_base()
-# Seconds before a request gives up: a hung connection (e.g. a half-open
-# tunnel) must fail with a clear error, not block the session forever.
-TIMEOUT = float(os.environ.get("RELAY_TIMEOUT", "30"))
+
+
+def _resolve_timeout() -> float:
+    """Seconds before a request gives up: a hung connection (e.g. a half-open
+    tunnel) must fail with a clear error, not block the session forever. The
+    default is above the server's own worst case (lock waits plus its
+    retries), so a slow write that will succeed isn't reported as failed."""
+    raw = os.environ.get("RELAY_TIMEOUT", "120")
+    try:
+        timeout = float(raw)
+    except ValueError:
+        timeout = 0
+    if not timeout > 0:
+        sys.exit(f"relay: RELAY_TIMEOUT must be a positive number of seconds, got {raw!r}")
+    return timeout
+
+
+TIMEOUT = _resolve_timeout()
 OPERATOR = "operator"
 ATTENTION_KINDS = {"decision", "approval", "security", "bug", "other"}
 
@@ -92,12 +108,25 @@ def _request(method: str, path: str, params: dict | None = None, json_body: dict
             body = resp.read()
             return json.loads(body) if body else {}
     except urllib.error.HTTPError as e:
-        raise RelayError(f"{method} {path} -> {e.code}: {e.read().decode()}") from e
+        try:
+            detail = e.read().decode(errors="replace")
+        except (OSError, http.client.HTTPException):   # the body itself timed out or broke off
+            detail = "(no response body)"
+        raise RelayError(f"{method} {path} -> {e.code}: {detail}") from e
     except urllib.error.URLError as e:
         raise RelayError(f"Can't reach relay API at {API_BASE} ({e.reason}).") from e
     except TimeoutError as e:
-        maybe = " It may still have been applied: check before retrying." if method in _MUTATING_METHODS else ""
-        raise RelayError(f"Relay API at {API_BASE} did not answer within {TIMEOUT:g}s ({method} {path}).{maybe}") from e
+        raise RelayError(f"Relay API at {API_BASE} did not answer within {TIMEOUT:g}s "
+                         f"({method} {path}).{_maybe_applied(method)}") from e
+    except (OSError, http.client.HTTPException) as e:
+        # The connection broke mid-request (e.g. the tunnel dropped): not
+        # wrapped in URLError by urllib, so caught here.
+        raise RelayError(f"Connection to relay API at {API_BASE} broke during {method} {path} "
+                         f"({type(e).__name__}).{_maybe_applied(method)}") from e
+
+
+def _maybe_applied(method: str) -> str:
+    return " It may still have been applied: check before retrying." if method in _MUTATING_METHODS else ""
 
 
 # ---------------------------------------------------------------------------

@@ -20,7 +20,7 @@
 # mail you haven't been told about (security-claude, pilot msg 746).
 # Exits 2 with a message on bad input, an unknown role or a 4xx from the
 # relay. If the relay is unreachable or erroring (5xx) it keeps waiting, but
-# only for DOWN_LIMIT seconds (MAILWATCH_DOWN_LIMIT, default 300): then it
+# only for DOWN_LIMIT seconds (MAILWATCH_DOWN_LIMIT, default 300; 0 = no limit): then it
 # exits 3, so the session is woken and told, instead of mail silently
 # stopping. A session that gets exit 3 checks the relay, then re-arms.
 # After its first check it waits for mail with POST /roles/<role>/wait: the
@@ -53,18 +53,18 @@ die() { echo "mailwatch: $*" >&2; exit 2; }
 DOWN_LIMIT=${MAILWATCH_DOWN_LIMIT:-300}
 [[ $DOWN_LIMIT =~ ^[0-9]+$ ]] || die "MAILWATCH_DOWN_LIMIT must be a number of seconds, got '$DOWN_LIMIT'"
 WAIT=${MAILWATCH_WAIT:-25}
-[[ $WAIT =~ ^[0-9]+$ ]] && [ "$WAIT" -le 60 ] || die "MAILWATCH_WAIT must be 0..60 seconds, got '$WAIT'"
+[[ $WAIT =~ ^[0-9]+$ ]] || die "MAILWATCH_WAIT must be a number of seconds, got '$WAIT'"
+[ "$WAIT" -le 25 ] || WAIT=25   # the relay's longest wait (it clamps too)
 use_wait=$([ "$WAIT" -gt 0 ] && echo 1)
 
 down_since=   # when the relay stopped answering (empty while it answers)
 # The relay didn't answer usefully (no connection, timeout, 5xx): wait one
 # interval, or give up with exit 3 once it has been down for DOWN_LIMIT.
 relay_down() {
-  local now; now=$(date +%s)
-  [ -z "$down_since" ] && down_since=$now
-  if [ $((now - down_since)) -ge "$DOWN_LIMIT" ]; then
-    echo "mailwatch: relay at $URL unreachable or erroring for $((now - down_since))s (last: HTTP $1)." >&2
-    echo "Check the relay (relay pending), then re-arm: $0 $ROLE $AFTER" >&2
+  down_since=${down_since:-$SECONDS}
+  if [ "$DOWN_LIMIT" -gt 0 ] && [ $((SECONDS - down_since)) -ge "$DOWN_LIMIT" ]; then
+    echo "mailwatch: relay at $URL unreachable or erroring for $((SECONDS - down_since))s (last: HTTP $1)." >&2
+    echo "Check the relay (relay pending; this watch used $URL), then re-arm: $0 $ROLE $AFTER" >&2
     exit 3
   fi
   sleep "$INTERVAL"
@@ -88,6 +88,7 @@ while :; do
       -H 'Content-Type: application/json' -d "{\"known\": $known}" \
       "$URL/roles/$ROLE/wait?timeout=$WAIT") || resp=$'\n000'
   else
+    # The first check, or polling (an older relay, or MAILWATCH_WAIT=0).
     curl -s -o /dev/null -m 5 -X POST -H 'X-Relay-Client: mailwatch.sh' "$URL/roles/$ROLE/heartbeat?interval=$INTERVAL" || true
     resp=$(curl -s -m 5 -w '\n%{http_code}' "$URL/roles/$ROLE/pending?peek=true") || resp=$'\n000'
   fi
@@ -120,5 +121,7 @@ while :; do
     echo "  $0 $ROLE $next"
     exit 0
   fi
-  [ -n "$use_wait" ] || sleep "$INTERVAL"   # a wait already waited
+  # In wait mode there is nothing to sleep for: a wait already waited, and
+  # the first check goes straight on to waiting. Polling sleeps.
+  [ -n "$use_wait" ] || sleep "$INTERVAL"
 done
