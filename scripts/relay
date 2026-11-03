@@ -294,6 +294,12 @@ def get_thread_history(thread_id: int) -> list[dict]:
     return _request("GET", f"/threads/{thread_id}/history")["messages"]
 
 
+def get_message(message_id: int) -> dict:
+    """One message's full body plus its thread/group -- far cheaper than
+    get_thread_history when you only need one. Marks nothing read."""
+    return _request("GET", f"/messages/{message_id}")
+
+
 def archive_thread(thread_id: int) -> None:
     """Coordinator-claude's judgment call, same footing as creating a group/
     thread -- once a topic is resolved, close it to new messages."""
@@ -430,6 +436,17 @@ def _cmd_history(args) -> None:
         print(f"#{m['message_id']} {m['created_at']} {m['sender_role']}: {_preview(m['body'])}{acked}")
 
 
+def _cmd_show(args) -> None:
+    m = get_message(args.message_id)
+    if args.full:
+        print(json.dumps(m, indent=2))
+        return
+    acked = f" (acked by {', '.join(m['acked_by'])})" if m["acked_by"] else ""
+    print(f"#{m['message_id']} thread {m['thread_id']} \"{m['topic']}\" "
+          f"{m['created_at']} {m['sender_role']}{acked}\n")
+    print(m["body"])
+
+
 def _cmd_groups(args) -> None:
     """Prints your hub_groups.md in the protocol's format; pair with --out to
     write it straight into your memory directory."""
@@ -519,6 +536,11 @@ def _cli() -> None:
     hi.add_argument("thread_id", type=int)
     hi.add_argument("--full", action="store_true", help="print full JSON instead of one line per message")
     hi.set_defaults(func=_cmd_history)
+
+    sh = sub.add_parser("show", help="one message's full body (cheaper than history)")
+    sh.add_argument("message_id", type=int)
+    sh.add_argument("--full", action="store_true", help="print full JSON instead")
+    sh.set_defaults(func=_cmd_show)
 
     gr = sub.add_parser("groups", help="your groups and their active threads, as hub_groups.md "
                                        "(write it with: relay --out <memory-dir>/hub_groups.md groups)")

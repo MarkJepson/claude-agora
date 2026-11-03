@@ -1045,6 +1045,40 @@ async def get_thread_history(thread_id: int):
     return {"messages": [{**r, "acked_by": acked_by.get(r["message_id"], [])} for r in rows]}
 
 
+@app.get("/messages/{message_id}")
+async def get_message(message_id: int):
+    """One message with its full body and where it lives, so a caller that
+    has only a message_id doesn't have to fetch a whole thread's history.
+    Read-only: it marks nothing delivered or read and records no last seen.
+    needs_operator is null unless the message carried a flag; open is true
+    until the operator answers or clears it."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """SELECT m.message_id, th.group_id, th.thread_id, th.topic,
+                      th.status AS thread_status, m.sender_role, m.body, m.created_at,
+                      m.attn_kind, m.attn_why, m.attn_answered_by, m.attn_cleared_at
+               FROM messages m JOIN threads th ON th.thread_id = m.thread_id
+               WHERE m.message_id = $1""",
+            message_id,
+        )
+        if row is None:
+            raise HTTPException(404, f"message {message_id} does not exist")
+        acked_by = [r["recipient_role"] for r in await conn.fetch(
+            """SELECT recipient_role FROM deliveries
+               WHERE message_id = $1 AND ack_at IS NOT NULL ORDER BY recipient_role""",
+            message_id,
+        )]
+    m = dict(row)
+    kind, why = m.pop("attn_kind"), m.pop("attn_why")
+    answered_by, cleared_at = m.pop("attn_answered_by"), m.pop("attn_cleared_at")
+    m["needs_operator"] = None if kind is None else {
+        "kind": kind, "why": why, "answered_by": answered_by, "cleared_at": cleared_at,
+        "open": answered_by is None and cleared_at is None,
+    }
+    m["acked_by"] = acked_by
+    return m
+
+
 def _esc(v) -> str:
     return html.escape(str(v)) if v is not None else ""
 

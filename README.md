@@ -90,6 +90,7 @@ relay post <thread_id> "text"       # or --file body.md, or piped stdin
 relay post <thread_id> "text" --needs-operator security "one-line why"
 relay new-thread "topic" --members role-a role-b
 relay history <thread_id>           # --full for JSON
+relay show <message_id>             # one message's full body (cheaper than history)
 relay attention                     # open needs_operator asks
 relay --out <memory-dir>/hub_groups.md groups   # your groups + active threads
 ```
@@ -116,6 +117,7 @@ on another role's behalf.
 | `/threads/{id}/messages` | POST | Post into a thread (`needs_operator` optional) |
 | `/threads/{id}/archive` | POST | Close a resolved topic |
 | `/threads/{id}/history` | GET | Full history with `acked_by` per message |
+| `/messages/{id}` | GET | One message: full body, thread/group/topic, `acked_by`, `needs_operator`. Marks nothing read |
 | `/messages/{id}/read` \| `/ack` | POST | Mark a message processed / info-only |
 | `/attention` | GET | Open `needs_operator` asks, oldest first |
 | `/dashboard` | GET | Human-readable view of all of the above |
