@@ -40,7 +40,7 @@ class FakeConn:
 
     async def fetch(self, sql, *args):
         self.pool.sql.append(sql)
-        return [{"recipient_role": r} for r in self.pool.acks]
+        return [{"message_id": args[0], "recipient_role": r} for r in self.pool.acks]
 
     async def execute(self, sql, *args):
         self.pool.writes.append(sql)
@@ -88,6 +88,12 @@ class GetMessage(unittest.TestCase):
         out = get(FakePool(message(attn_kind="decision", attn_why="w", attn_answered_by=50)))
         self.assertFalse(out["needs_operator"]["open"])
         self.assertEqual(out["needs_operator"]["answered_by"], 50)
+
+    def test_acks_leave_out_the_sender(self):
+        # As the dashboard does (d.recipient_role <> m.sender_role).
+        pool = FakePool(message())
+        get(pool)
+        self.assertIn("d.recipient_role <> m.sender_role", pool.sql[-1])
 
     def test_reading_writes_nothing(self):
         pool = FakePool(message())

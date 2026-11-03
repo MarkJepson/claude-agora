@@ -1032,20 +1032,30 @@ async def get_thread_history(thread_id: int):
                FROM messages WHERE thread_id = $1 ORDER BY message_id""",
             thread_id,
         )
-        acks = await conn.fetch(
-            """SELECT d.message_id, d.recipient_role
-               FROM deliveries d JOIN messages m ON m.message_id = d.message_id
-               WHERE m.thread_id = $1 AND d.ack_at IS NOT NULL
-               ORDER BY d.message_id, d.recipient_role""",
-            thread_id,
-        )
-    acked_by: dict[int, list] = {}
-    for a in acks:
-        acked_by.setdefault(a["message_id"], []).append(a["recipient_role"])
+        acked_by = await _acked_by(conn, "m.thread_id = $1", thread_id)
     return {"messages": [{**r, "acked_by": acked_by.get(r["message_id"], [])} for r in rows]}
 
 
+async def _acked_by(conn: agora_db.Conn, where: str, arg) -> dict[int, list]:
+    """message_id -> roles that acked it, for the messages matching `where`
+    (a fixed condition on m, never caller input). The sender is left out, as
+    the dashboard leaves it out, so history, /messages/{id} and the dashboard
+    agree."""
+    acks = await conn.fetch(
+        f"""SELECT d.message_id, d.recipient_role
+            FROM deliveries d JOIN messages m ON m.message_id = d.message_id
+            WHERE {where} AND d.ack_at IS NOT NULL AND d.recipient_role <> m.sender_role
+            ORDER BY d.message_id, d.recipient_role""",
+        arg,
+    )
+    out: dict[int, list] = {}
+    for a in acks:
+        out.setdefault(a["message_id"], []).append(a["recipient_role"])
+    return out
+
+
 @app.get("/messages/{message_id}")
+@retry_on_db_error
 async def get_message(message_id: int):
     """One message with its full body and where it lives, so a caller that
     has only a message_id doesn't have to fetch a whole thread's history.
@@ -1063,11 +1073,7 @@ async def get_message(message_id: int):
         )
         if row is None:
             raise HTTPException(404, f"message {message_id} does not exist")
-        acked_by = [r["recipient_role"] for r in await conn.fetch(
-            """SELECT recipient_role FROM deliveries
-               WHERE message_id = $1 AND ack_at IS NOT NULL ORDER BY recipient_role""",
-            message_id,
-        )]
+        acked_by = (await _acked_by(conn, "m.message_id = $1", message_id)).get(message_id, [])
     m = dict(row)
     kind, why = m.pop("attn_kind"), m.pop("attn_why")
     answered_by, cleared_at = m.pop("attn_answered_by"), m.pop("attn_cleared_at")

@@ -442,8 +442,15 @@ def _cmd_show(args) -> None:
         print(json.dumps(m, indent=2))
         return
     acked = f" (acked by {', '.join(m['acked_by'])})" if m["acked_by"] else ""
-    print(f"#{m['message_id']} thread {m['thread_id']} \"{m['topic']}\" "
-          f"{m['created_at']} {m['sender_role']}{acked}\n")
+    archived = " [archived]" if m["thread_status"] == "archived" else ""
+    print(f"#{m['message_id']} thread {m['thread_id']} \"{m['topic']}\"{archived} "
+          f"{m['created_at']} {m['sender_role']}{acked}")
+    ask = m["needs_operator"]
+    if ask:
+        state = ("open" if ask["open"] else
+                 f"answered by #{ask['answered_by']}" if ask["answered_by"] else "cleared")
+        print(f"needs_operator ({ask['kind']}, {state}): {ask['why']}")
+    print()
     print(m["body"])
 
 

@@ -184,6 +184,7 @@ curl -s $A/messages/$LEFT >/dev/null
 eq "message GET leaves last_seen" "$(db "SELECT last_seen_at FROM roles WHERE role='$ME'")" "$SEEN1"
 eq "message GET marks nothing" "$(db "SELECT delivered_at IS NULL AND read_at IS NULL FROM deliveries WHERE message_id=$LEFT AND recipient_role='$ME'")" 1
 eq "missing message 404"       "$(code $A/messages/99999999)" 404
+eq "relay show names the open ask" "$(RELAY_URL=$A "$REPO_ROOT/scripts/relay" show $ASK3 | sed -n 2p)" "needs_operator (approval, open): QA: approve PR #999 (UI test)"
 eq "pending drops read/acked"  "$(mine | jq length)" 1
 eq "read by non-recipient 404" "$(code -X POST "$A/messages/$M1/read?role=observability-claude")" 404
 eq "read missing message 404"  "$(code -X POST "$A/messages/99999999/read?role=$ME")" 404
