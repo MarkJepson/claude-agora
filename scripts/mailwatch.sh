@@ -34,7 +34,9 @@
 # When it wakes the session it marks those messages "delivered" for the
 # role (WhatsApp-style: it reached the session). It never marks anything
 # read; only the session does that, once it has actually read it.
-# Prints message ids only (not bodies): the session pulls content itself.
+# Prints message ids only (not bodies): the session pulls content itself,
+# and the Next: line points it at `relay pending --bodies` (just the unread
+# mail) rather than at whole thread histories.
 set -u
 usage="usage: mailwatch.sh <role> <after_id> [interval_seconds]"
 ROLE=${1:?$usage}
@@ -117,7 +119,9 @@ while :; do
     echo "relay mail for $ROLE: $(printf '%s\n' "$new" | wc -l) new"
     printf '%s\n' "$new" | while read -r id thread from; do echo "  msg $id in thread $thread from $from"; done
     next=$(printf '%s\n' "$new" | awk -v a="$AFTER" '$1 > a { a = $1 } END { print a }')
-    echo "Next: GET /roles/$ROLE/pending, read or ack each message, then re-arm:"
+    echo "Next: read them with \`relay pending --bodies\` (the full text of just your unread mail;"
+    echo "use \`relay show <id>\` for one message, and \`relay history <thread>\` only for a thread"
+    echo "that's new to you), read or ack each message, then re-arm:"
     echo "  $0 $ROLE $next"
     exit 0
   fi

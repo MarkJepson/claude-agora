@@ -282,6 +282,12 @@ eq "wakes on new mail (exit 0)" "$RC" 0
 grep -q "msg $MW in thread $T from operator" /tmp/qa_watch2 && ok "prints the new msg id" || bad "prints the new msg id" "$(cat /tmp/qa_watch2)"
 grep -q "$ME $MW\$" /tmp/qa_watch2 && ok "prints concrete re-arm id" || bad "prints concrete re-arm id" "$(tail -1 /tmp/qa_watch2)"
 eq "marks it delivered, not read" "$(db "SELECT delivered_at IS NOT NULL AND read_at IS NULL FROM deliveries WHERE message_id=$MW AND recipient_role='$ME'")" 1
+grep -q 'relay pending --bodies' /tmp/qa_watch2 && ok "Next: points at relay pending --bodies" || bad "Next: points at relay pending --bodies" "$(cat /tmp/qa_watch2)"
+RELAY_ROLE=$ME RELAY_URL=$A "$REPO_ROOT/scripts/relay" pending --bodies >/tmp/qa_bodies
+grep -q "^#$MW thread $T \"" /tmp/qa_bodies && ok "relay pending --bodies: header" || bad "relay pending --bodies: header" "$(head -3 /tmp/qa_bodies)"
+grep -qx "QA mailwatch trigger." /tmp/qa_bodies && ok "relay pending --bodies: full body" || bad "relay pending --bodies: full body" "$(cat /tmp/qa_bodies)"
+eq "relay pending --bodies is read-only" "$(db "SELECT read_at IS NULL FROM deliveries WHERE message_id=$MW AND recipient_role='$ME'")" 1
+RELAY_ROLE=$ME RELAY_URL=$A "$REPO_ROOT/scripts/relay" pending --bodies --full >/dev/null 2>&1; eq "--bodies with --full refused" "$?" 2
 UND=$(post /threads/$T/messages '{"sender_role":"operator","body":"QA undelivered, below the re-arm id."}' | jq -r .message_id)
 FUT=$(( UND + 1000 ))
 timeout 8 $W $ME $FUT 2 >/tmp/qa_watch4; RC=$?
