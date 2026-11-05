@@ -31,6 +31,7 @@ import http.client
 import io
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.parse
@@ -346,9 +347,41 @@ def clear_attention_batch(message_ids: list[int]) -> dict:
 # CLI
 # ---------------------------------------------------------------------------
 
-def _preview(body: str, n: int = 80) -> str:
+def _strip_signature(body: str, sender_role: str) -> str:
+    """Drop a leading '🤖 Claude · <sender_role>.' signature line or prefix:
+    the listing already names the sender, so a preview spent on it is wasted."""
+    sig = re.match(r"\s*🤖\s*Claude\s*·\s*" + re.escape(sender_role) + r"(?![\w-])\.?\s*", body)
+    return body[sig.end():] if sig else body
+
+
+def _preview(body: str, n: int = 80, sender_role: str | None = None) -> str:
+    if sender_role:
+        body = _strip_signature(body, sender_role)
     line = body.strip().splitlines()[0] if body.strip() else ""
     return line if len(line) <= n else line[: n - 1] + "…"
+
+
+def _by_thread(pending: list[dict]) -> list[list[dict]]:
+    """Group messages by thread: threads in order of their first message,
+    messages in id order within each."""
+    groups: dict[int, list[dict]] = {}
+    for m in sorted(pending, key=lambda m: m["message_id"]):
+        groups.setdefault(m["thread_id"], []).append(m)
+    return list(groups.values())
+
+
+def _thread_header(msgs: list[dict]) -> str:
+    m = msgs[0]
+    return f"thread {m['thread_id']} \"{m['topic']}\" ({len(msgs)} unread)"
+
+
+def _print_short(pending: list[dict], indent: str = "") -> None:
+    """One header per thread, then one preview line per message under it."""
+    for msgs in _by_thread(pending):
+        print(indent + _thread_header(msgs))
+        for m in msgs:
+            print(f"{indent}  #{m['message_id']} {m['sender_role']}: "
+                  f"{_preview(m['body'], sender_role=m['sender_role'])}")
 
 
 def _read_body(args) -> str:
@@ -370,9 +403,7 @@ def _cmd_start(args) -> None:
         highest = 0
     else:
         print(f"{role}: bound to {args.session_name}. {len(pending)} pending:")
-        for m in pending:
-            print(f"  #{m['message_id']} thread {m['thread_id']} \"{m['topic']}\" "
-                  f"from {m['sender_role']}: {_preview(m['body'])}")
+        _print_short(pending, indent="  ")
         highest = max(m["message_id"] for m in pending)
     watch_path = Path(__file__).resolve().parent / "mailwatch.sh"
     if pending:
@@ -400,17 +431,17 @@ def _cmd_pending(args) -> None:
     if args.bodies:
         # The full text of just the unread mail: what a session woken by its
         # mail watch needs, without pulling each thread's whole history.
-        for i, m in enumerate(pending):
+        # One header per thread, then each message's body under it.
+        for i, msgs in enumerate(_by_thread(pending)):
             if i:
                 print("\n" + "=" * 72 + "\n")
-            print(f"#{m['message_id']} thread {m['thread_id']} \"{m['topic']}\" "
-                  f"{m['created_at']} from {m['sender_role']}")
-            print()
-            print(m["body"])
+            print(_thread_header(msgs))
+            for m in msgs:
+                print("\n" + "-" * 8 + f" #{m['message_id']} {m['created_at']} "
+                      f"from {m['sender_role']}\n")
+                print(m["body"])
         return
-    for m in pending:
-        print(f"#{m['message_id']} thread {m['thread_id']} \"{m['topic']}\" "
-              f"from {m['sender_role']}: {_preview(m['body'])}")
+    _print_short(pending)
 
 
 def _cmd_read(args) -> None:

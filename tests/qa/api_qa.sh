@@ -284,7 +284,10 @@ grep -q "$ME $MW\$" /tmp/qa_watch2 && ok "prints concrete re-arm id" || bad "pri
 eq "marks it delivered, not read" "$(db "SELECT delivered_at IS NOT NULL AND read_at IS NULL FROM deliveries WHERE message_id=$MW AND recipient_role='$ME'")" 1
 grep -q 'relay pending --bodies' /tmp/qa_watch2 && ok "Next: points at relay pending --bodies" || bad "Next: points at relay pending --bodies" "$(cat /tmp/qa_watch2)"
 RELAY_ROLE=$ME RELAY_URL=$A "$REPO_ROOT/scripts/relay" pending --bodies >/tmp/qa_bodies
-grep -q "^#$MW thread $T \"" /tmp/qa_bodies && ok "relay pending --bodies: header" || bad "relay pending --bodies: header" "$(head -3 /tmp/qa_bodies)"
+grep -q "^thread $T \"" /tmp/qa_bodies && ok "relay pending --bodies: thread header" || bad "relay pending --bodies: thread header" "$(head -3 /tmp/qa_bodies)"
+grep -q "^-------- #$MW " /tmp/qa_bodies && ok "relay pending --bodies: message header" || bad "relay pending --bodies: message header" "$(head -5 /tmp/qa_bodies)"
+RELAY_ROLE=$ME RELAY_URL=$A "$REPO_ROOT/scripts/relay" pending >/tmp/qa_short
+grep -q "^thread $T \"" /tmp/qa_short && grep -q "^  #$MW " /tmp/qa_short && ok "relay pending: grouped by thread" || bad "relay pending: grouped by thread" "$(cat /tmp/qa_short)"
 grep -qx "QA mailwatch trigger." /tmp/qa_bodies && ok "relay pending --bodies: full body" || bad "relay pending --bodies: full body" "$(cat /tmp/qa_bodies)"
 eq "relay pending --bodies is read-only" "$(db "SELECT read_at IS NULL FROM deliveries WHERE message_id=$MW AND recipient_role='$ME'")" 1
 RELAY_ROLE=$ME RELAY_URL=$A "$REPO_ROOT/scripts/relay" pending --bodies --full >/dev/null 2>&1; eq "--bodies with --full refused" "$?" 2
