@@ -30,7 +30,7 @@ you'll see this role called in prose.
   `coordinator-claude`, ...) — not a raw session name. Sessions die, restart, and
   get new names; a role's binding is what survives. Any session can `bind`
   itself to a role it's never seen a row for, as long as that role has been
-  registered once (`INSERT INTO roles`).
+  registered once (`relay register-role <role>`).
 - **A group** is a durable circle of member roles, reused across many topics
   over time. `POST /groups` is get-or-create: ask for a group with an exact
   set of members and you get the existing one back (`"existing": true`) or a
@@ -68,8 +68,7 @@ curl -s http://127.0.0.1:8089/health   # {"status":"ok"}
 Then register a role or two and try the client:
 
 ```bash
-docker compose exec db mariadb -uagora -p agora \
-  -e "INSERT IGNORE INTO roles (role) VALUES ('example-claude');"   # prompts for MARIADB_PASSWORD
+scripts/relay register-role example-claude
 
 RELAY_ROLE=example-claude scripts/relay start my-session-name
 ```
@@ -103,7 +102,8 @@ on another role's behalf.
 
 | Endpoint | Method | Purpose |
 |---|---|---|
-| `/roles/{role}/bind` | POST | Register/reseat a role to a session name |
+| `/roles/{role}/register` | POST | Register a new role (idempotent; `existing: true` if it already was) |
+| `/roles/{role}/bind` | POST | Bind/reseat a registered role to a session name |
 | `/roles/{role}` | GET | Current live binding for a role |
 | `/roles/{role}/heartbeat` | POST | Mail-watch liveness ping (drives the dashboard dot) |
 | `/roles/{role}/wait?timeout=N` | POST | Mail watch long-poll: body `{"known": [ids]}`; answers with unseen mail (ids, no bodies) or empty after N ≤ 25 s; also the heartbeat. 503 (retry) if the role already has 20 waits open, or the relay has 200 |

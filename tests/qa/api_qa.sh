@@ -31,11 +31,9 @@ post() { curl -s -X POST "$A$1" -H 'Content-Type: application/json' -H 'X-Relay-
 db()   { (cd "$REPO_ROOT" && docker compose exec -T -e MYSQL_PWD="$(docker compose exec -T db printenv MARIADB_PASSWORD | tr -d '\r')" db mariadb -uagora agora -N -B -e "$1"); }
 mine() { curl -s "$A/roles/$ME/pending?peek=true" | jq -c "[.pending[] | select(.thread_id==$T) | .message_id]"; }
 
-# Roles this suite exercises. Registering a role has no API (deliberately
-# -- see BUILD.md), so QA seeds its own via direct insert, same as a human
-# operator would for a real role.
+# Roles this suite exercises, registered through the API (idempotent).
 for r in coordinator-claude architect-claude security-claude observability-claude; do
-  db "INSERT IGNORE INTO roles (role) VALUES ('$r')" >/dev/null
+  post "/roles/$r/register" '{}' >/dev/null
 done
 
 echo "== health / routes"
@@ -53,6 +51,25 @@ echo "== operator isn't a role"
 eq "operator as group member 422"  "$(code -X POST $A/groups -H 'Content-Type: application/json' -d '{"members":["coordinator-claude","operator"]}')" 422
 eq "bind operator 422"             "$(code -X POST $A/roles/operator/bind -H 'Content-Type: application/json' -d '{"session_name":"x"}')" 422
 eq "heartbeat operator 404"        "$(code -X POST "$A/roles/operator/heartbeat?interval=20")" 404
+
+echo "== register a role"
+NEWR=qa-registered-role
+db "DELETE FROM roles WHERE role='$NEWR'" >/dev/null
+eq "bind unregistered 404"      "$(code -X POST $A/roles/$NEWR/bind -H 'Content-Type: application/json' -d '{"session_name":"qa-x"}')" 404
+eq "register new"               "$(post /roles/$NEWR/register '{}')" "{\"role\":\"$NEWR\",\"existing\":false}"
+eq "register again: existing"   "$(post /roles/$NEWR/register '{}')" "{\"role\":\"$NEWR\",\"existing\":true}"
+eq "bind after register"        "$(post /roles/$NEWR/bind '{"session_name":"qa-x"}')" '{"ok":true}'
+eq "register operator 422"      "$(code -X POST $A/roles/operator/register)" 422
+eq "register uppercase 422"     "$(code -X POST $A/roles/Bad-Role/register)" 422
+eq "register double hyphen 422" "$(code -X POST $A/roles/bad--role/register)" 422
+eq "register leading digit 422" "$(code -X POST $A/roles/1role/register)" 422
+eq "register trailing hyphen 422" "$(code -X POST $A/roles/role-/register)" 422
+eq "register 65 chars 422"      "$(code -X POST $A/roles/a$(printf 'b%.0s' $(seq 64))/register)" 422
+eq "register 64 chars ok"       "$(code -X POST $A/roles/a$(printf 'b%.0s' $(seq 63))/register)" 200
+eq "register needs X-Relay-Client" "$(curl -s -o /dev/null -w '%{http_code}' -X POST $A/roles/qa-no-header/register)" 403
+eq "relay register-role"        "$(RELAY_URL=$A "$REPO_ROOT/scripts/relay" register-role $NEWR)" "{\"role\": \"$NEWR\", \"existing\": true}"
+db "DELETE FROM role_bindings WHERE role IN ('$NEWR', 'a$(printf 'b%.0s' $(seq 63))')" >/dev/null
+db "DELETE FROM roles WHERE role IN ('$NEWR', 'a$(printf 'b%.0s' $(seq 63))')" >/dev/null
 
 echo "== bind + last_seen"
 SESSION=$(curl -s $A/roles/$ME | jq -r .session_name)
