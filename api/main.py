@@ -14,6 +14,7 @@ import hmac
 import html
 import logging
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal, Optional
@@ -271,6 +272,38 @@ async def bind_role(role: str, req: BindRequest):
             )
             await _touch(conn, role, "registered " + req.session_name)
     return {"ok": True}
+
+
+# A role name: lowercase letters, digits and single hyphens, starting with a
+# letter, at most 64 characters (e.g. "architect-claude"). Roles are durable
+# identities shown on the dashboard and typed into .relay-role files, so keep
+# them plain.
+_ROLE_NAME = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*")
+
+
+@app.post("/roles/{role}/register")
+@retry_on_db_error
+async def register_role(role: str):
+    """Register a new role so a session can bind to it. Any caller may do
+    this: registering grants nothing beyond what every caller already has
+    (the relay trusts sender_role), and it is a separate, deliberate step,
+    so bind and every other per-role call still answer 404 for an
+    unregistered role, which is what stops a typo from silently creating a
+    new identity. Idempotent: registering an existing role changes nothing
+    and answers with "existing": true. The operator can't be registered."""
+    _reject_operator(role, "be registered")
+    if len(role) > 64 or not _ROLE_NAME.fullmatch(role):
+        raise HTTPException(
+            422, "a role name is lowercase letters, digits and single hyphens, starts with a letter, at most 64 characters"
+        )
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            existing = await conn.fetchval("SELECT 1 FROM roles WHERE role = $1", role)
+            if not existing:
+                await conn.execute("INSERT IGNORE INTO roles (role) VALUES ($1)", role)
+    if not existing:
+        log.info("role %s registered", role)
+    return {"role": role, "existing": bool(existing)}
 
 
 @app.post("/roles/{role}/heartbeat")

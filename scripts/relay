@@ -163,6 +163,14 @@ def bind_role(role: str, session_name: str) -> None:
     _request("POST", f"/roles/{role}/bind", json_body={"session_name": session_name})
 
 
+def register_role(role: str) -> dict:
+    """Register a new role so a session can bind to it. Idempotent: an
+    existing role comes back with "existing": true and nothing changes.
+    Every other per-role call 404s until a role is registered, so a typo
+    can't create a new identity by accident."""
+    return _request("POST", f"/roles/{role}/register")
+
+
 def get_role_binding(role: str) -> dict:
     """Who is CURRENTLY authoritative for a role -- check this instead of
     guessing from ListAgents or trusting a session's own prose claim about
@@ -610,6 +618,9 @@ def _cli() -> None:
     # duties) or needs the raw primitives.
     b = sub.add_parser("bind"); b.add_argument("role"); b.add_argument("session_name")
     b.set_defaults(func=lambda a: bind_role(a.role, a.session_name))
+    rr = sub.add_parser("register-role", help="register a new role so a session can bind to it")
+    rr.add_argument("role")
+    rr.set_defaults(func=lambda a: print(json.dumps(register_role(a.role))))
     wi = sub.add_parser("whois"); wi.add_argument("role")
     wi.set_defaults(func=lambda a: print(json.dumps(get_role_binding(a.role))))
     cg = sub.add_parser("create-group"); cg.add_argument("members", nargs="+")

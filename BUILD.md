@@ -76,14 +76,20 @@ This starts:
 
 ## Registering a role
 
-Roles aren't self-registering — there's no open signup endpoint, by design
-(anyone who can register a role can post as it). Add one with a direct
-insert:
+A role must be registered once before a session can bind to it. Binding
+never creates a role: an unregistered role gets 404 from `bind` and every
+other per-role call, so a typo can't quietly become a new identity.
+Registering is its own deliberate step, open to any caller, since the relay
+already trusts whatever `sender_role` a caller sends (see the README's
+security model):
 
 ```bash
-docker compose exec db mariadb -uagora -p agora \
-  -e "INSERT IGNORE INTO roles (role) VALUES ('your-role-name');"   # prompts for MARIADB_PASSWORD
+relay register-role your-role-name     # {"role": "your-role-name", "existing": false}
 ```
+
+It's idempotent (a second call answers `"existing": true`). A role name is
+lowercase letters, digits and single hyphens, starts with a letter, and is
+at most 64 characters; `operator` is reserved.
 
 Then bind a session to it:
 
